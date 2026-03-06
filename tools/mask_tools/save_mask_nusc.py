@@ -196,8 +196,10 @@ if __name__ == "__main__":
     config ='projects/configs/_base_/nuimages/htc_x101_64x4d_fpn_dconv_c3-c5_coco-20e_16x1_20e_nuim.py'
     checkpoint = 'ckpt/htc_x101_64x4d_fpn_dconv_c3-c5_coco-20e_16x1_20e_nuim_20201008_211222-0b16ac4b.pth'
 
-    info_path = f'data/nuscenes/nuscenes_infos_{args.split}.pkl'
-    out_path = 'data/frustum_mask/nuScenes'
+    # info_path = f'data/nuscenes/nuscenes_infos_{args.split}.pkl'
+    # out_path = 'data/frustum_mask/nuScenes'
+    info_path = f'data/nuscenes_mini/nuscenes_infos_{args.split}.pkl'
+    out_path = 'data/frustum_mask/nuscenes_mini'
     os.makedirs(out_path, exist_ok=True)
 
     score_thre_init = 0.1
