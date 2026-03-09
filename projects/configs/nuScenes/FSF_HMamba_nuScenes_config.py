@@ -95,15 +95,32 @@ segmentor = dict(
     ),
     train_cfg=dict(
         point_loss=True,
-        score_thresh=seg_score_thresh, # for training log
-        class_names=class_names, # for training log
+        score_thresh=seg_score_thresh,
+        class_names=class_names,
         group_names=group_names,
         group_lens=group_lens,
     ),
 )
 
 model = dict(
-    type='FSF',
+    # ------------------------------------------------------------------ #
+    # 使用 FSF_HMamba 替代 FSF，其余配置与 FSF_nuScenes_config.py 完全相同
+    # ------------------------------------------------------------------ #
+    type='FSF_HMamba',
+
+    # H-Mamba 跨模态交互模块配置
+    # d_model 与 embed_dims（1024）保持一致
+    # d_state=16: SSM 状态空间维度 N（复杂度 O(m·N)）
+    # expand_factor=2: 内部维度 = 2 × d_model = 2048
+    hmamba_cfg=dict(
+        d_model=1024,
+        d_state=16,
+        expand_factor=2,
+        dt_rank='auto',
+        conv_kernel=4,
+        use_fast_path=False,   # 使用 mamba_ssm CUDA kernel
+    ),
+
     num_classes=num_classes,
     num_cams=6,
     class_names=class_names,
@@ -144,7 +161,7 @@ model = dict(
         tasks=tasks,
         class_names=class_names,
         common_attrs=dict(
-            center=(3, 2, 128), dim=(3, 2, 128), rot=(2, 2, 128), vel=(2, 2, 128)  # (out_dim, num_layers, hidden_dim)
+            center=(3, 2, 128), dim=(3, 2, 128), rot=(2, 2, 128), vel=(2, 2, 128)
         ),
         num_cls_layer=2,
         cls_hidden_dim=128,
@@ -177,7 +194,7 @@ model = dict(
         group_names=[group1, group2, group3, group4, group5, group6],
         use_rotate_nms=True,
         nms_pre=-1,
-        nms_thr=0.25, # from 0.25 to 0.7 for retest
+        nms_thr=0.25,
         score_thr=0.05, 
         min_bbox_size=0,
         max_num=500,
@@ -254,7 +271,7 @@ model = dict(
             nms_thr=0.35,
             score_thr=0.01,
             min_bbox_size=0,
-            max_num=500,  #6 * 83 < 500
+            max_num=500,
         ),
         norm_cfg=dict(type='LN'),
         tasks=tasks,
@@ -263,7 +280,7 @@ model = dict(
             center=(3, 2, 128), 
             dim=(3, 2, 128), 
             rot=(2, 2, 128), 
-            vel=(2, 2, 128), # (out_dim, num_layers, hidden_dim)
+            vel=(2, 2, 128),
         ),
         num_cls_layer=2,
         cls_hidden_dim=128,
@@ -354,8 +371,7 @@ model = dict(
                         dict(num_class=1, class_names=["traffic_cone"]),
                         dict(num_class=1, class_names=["barrier"]),
                     ],
-                    ##          Car    truck  trailer bus   cv     bicycle motorcycle  pedestrian traffic_cone barrier
-                    max_dist = [[1.0], [1.0], [2.0], [4.0], [0.5], [0.5],  [0.5],      [0.5],     [0.5],       [0.0],],
+                    max_dist = [[1.0], [1.0], [2.0], [4.0], [0.5], [0.5],  [0.5], [0.5], [0.5], [0.0],],
                     class_names=class_names,
                 ),
                 class_names=class_names,
@@ -373,14 +389,13 @@ model = dict(
             loss_vel=dict(type='L1Loss', loss_weight=0.2),
             in_channel=1024,
             shared_mlp_dims=[1024, 1024],
-
             test_cfg=dict(
                 use_rotate_nms=True,
                 nms_pre=-1,
                 nms_thr=0.35,
                 score_thr=0.01,
                 min_bbox_size=0,
-                max_num=500,  #6 * 83 < 500
+                max_num=500,
             ),
             norm_cfg=dict(type='LN'),
             tasks=tasks,
@@ -389,7 +404,7 @@ model = dict(
                 center=(3, 2, 128), 
                 dim=(3, 2, 128), 
                 rot=(2, 2, 128), 
-                vel=(2, 2, 128), # (out_dim, num_layers, hidden_dim)
+                vel=(2, 2, 128),
             ),
             num_cls_layer=2,
             cls_hidden_dim=128,

@@ -1,6 +1,6 @@
 _base_ = [
-    '../_base_/datasets/nuscenes_dataloader_mini.py',
-    '../_base_/schedules/cyclic_20e.py',
+    '../_base_/datasets/AV2_dataloader.py',
+    '../_base_/schedules/cosine_2x.py',
     '../_base_/default_runtime.py',
 ]
 
@@ -8,28 +8,54 @@ plugin=True
 plugin_dir='projects/mmdet3d_plugin/'
 
 seg_voxel_size = (0.2, 0.2, 0.2)
-point_cloud_range = [-51.2, -51.2, -5, 51.2, 51.2, 3]
-sparse_shape = [40, 512, 512]
-class_names = [
-    'car', 'truck', 'trailer', 'bus', 'construction_vehicle', 'bicycle',
-    'motorcycle', 'pedestrian', 'traffic_cone', 'barrier'
-]
+point_cloud_range = [-204.8, -204.8, -3.2, 204.8, 204.8, 3.2]
+class_names = \
+['Regular_vehicle',
 
-tasks = [
-            dict(num_class=10, class_names=class_names),
-        ]
-num_classes = len(class_names)
-group1 = ['car']
-group2 = ['truck', 'construction_vehicle']
-group3 = ['bus', 'trailer']
-group4 = ['barrier']
-group5 = ['motorcycle', 'bicycle']
-group6 = ['pedestrian', 'traffic_cone']
+ 'Pedestrian',
+ 'Bicyclist',
+ 'Motorcyclist',
+ 'Wheeled_rider',
+
+ 'Bollard',
+ 'Construction_cone',
+ 'Sign',
+ 'Construction_barrel',
+ 'Stop_sign',
+ 'Mobile_pedestrian_crossing_sign',
+
+ 'Large_vehicle',
+ 'Bus',
+ 'Box_truck',
+ 'Truck',
+ 'Vehicular_trailer',
+ 'Truck_cab',
+ 'School_bus',
+ 'Articulated_bus',
+ 'Message_board_trailer',
+
+ 'Bicycle',
+ 'Motorcycle',
+ 'Wheeled_device',
+ 'Wheelchair',
+ 'Stroller',
+
+ 'Dog']
+group1 = class_names[:1]
+group2 = class_names[1:5]
+group3 = class_names[5:11]
+group4 = class_names[11:20]
+group5 = class_names[20:25]
+group6 = class_names[25:]
 group_names=[group1, group2, group3, group4, group5, group6]
+num_classes = len(class_names)
 
-seg_score_thresh = [0.1, ] * 6
+seg_score_thresh = [0.4, 0.25, 0.25, 0.25, 0.25, 0.25]
 group_lens = [len(group1), len(group2), len(group3), len(group4), len(group5), len(group6)]
 
+tasks=[dict(class_names=class_names),]
+
+num_cams = 7
 segmentor = dict(
     type='VoteSegmentor',
     tanh_dims=[],
@@ -41,14 +67,13 @@ segmentor = dict(
     ),
     voxel_encoder=dict(
         type='DynamicScatterVFE',
-        in_channels=5,
+        in_channels=4,
         feat_channels=[64, 64],
         voxel_size=seg_voxel_size,
         with_cluster_center=True,
         with_voxel_center=True,
         point_cloud_range=point_cloud_range,
         norm_cfg=dict(type='naiveSyncBN1d', eps=1e-3, momentum=0.01),
-        unique_once=True,
     ),
 
     middle_encoder=dict(
@@ -58,15 +83,15 @@ segmentor = dict(
     backbone=dict(
         type='SimpleSparseUNet',
         in_channels=64,
-        sparse_shape=sparse_shape,
+        sparse_shape=[32, 2048, 2048],
         order=('conv', 'norm', 'act'),
         norm_cfg=dict(type='naiveSyncBN1d', eps=1e-3, momentum=0.01),
         base_channels=64,
-        output_channels=128, 
-        encoder_channels=((128, ), (128, 128, 128), (128, 128, 128), (256, 256, 256), (512, 512, 512)),
-        encoder_paddings=((1, ), (1, 1, 1), (1, 1, 1), ((0, 1, 1), 1, 1), (1, 1, 1)),
-        decoder_channels=((512, 512, 256), (256, 256, 128), (128, 128, 128), (128, 128, 128), (128, 128, 128)),
-        decoder_paddings=((1, 1), (1, 0), (1, 0), (0, 0), (0, 1)), 
+        output_channels=128,
+        encoder_channels=((64, ), (64, 64, 64), (64, 64, 64), (128, 128, 128)),
+        encoder_paddings=((1, ), (1, 1, 1), (1, 1, 1), ((0, 1, 1), 1, 1)),
+        decoder_channels=((128, 128, 64), (64, 64, 64), (64, 64, 64), (64, 64, 64)),
+        decoder_paddings=((1, 0), (1, 0), (0, 0), (0, 1)),
     ),
 
     decode_neck=dict(
@@ -77,7 +102,7 @@ segmentor = dict(
 
     segmentation_head=dict(
         type='VoteSegHead',
-        in_channel=67 + 64,
+        in_channel=67,
         hidden_dims=[128, 128],
         num_classes=num_classes,
         dropout_ratio=0.0,
@@ -88,32 +113,60 @@ segmentor = dict(
             type='CrossEntropyLoss',
             use_sigmoid=False,
             class_weight=[1.0, ] * num_classes + [0.1,], 
-            loss_weight=10.0),
+            loss_weight=3.0),
         loss_vote=dict(
             type='L1Loss',
             loss_weight=1.0),
     ),
     train_cfg=dict(
         point_loss=True,
-        score_thresh=seg_score_thresh, # for training log
-        class_names=class_names, # for training log
+        score_thresh=seg_score_thresh,
+        class_names=class_names,
         group_names=group_names,
         group_lens=group_lens,
     ),
+    test_cfg=dict(
+        point_loss=True,
+        score_thresh=(0.5, 0.2, 0.2),
+        clustering_voxel_size=(0.5, 0.5, 6),
+    )
 )
 
 model = dict(
-    type='FSF',
-    num_classes=num_classes,
-    num_cams=6,
-    class_names=class_names,
+    # ------------------------------------------------------------------ #
+    # 使用 FSF_HMamba 替代 FSF，其余配置与 FSF_AV2_config.py 完全相同
+    # ------------------------------------------------------------------ #
+    type='FSF_HMamba',
 
+    # H-Mamba 跨模态交互模块配置
+    # d_model 与 embed_dims（1024）保持一致
+    # d_state=16: SSM 状态空间维度 N（复杂度 O(m·N)）
+    # expand_factor=2: 内部维度 = 2 × d_model = 2048
+    hmamba_cfg=dict(
+        d_model=1024,
+        d_state=16,
+        expand_factor=2,
+        dt_rank='auto',
+        conv_kernel=4,
+        use_fast_path=True,   # 使用 mamba_ssm CUDA kernel
+    ),
+
+    num_classes=num_classes,
+    num_cams=num_cams,
+    class_names=class_names,
+    is_argo = True,
     #LiDAR Query Generation
     segmentor=segmentor,
+    segmentor_updated_mlp=dict(
+                    in_channel=32, 
+                    mlp_channel=[128, 67],
+                    norm_cfg=dict(type='LN', eps=1e-3),
+                    act='gelu',
+                ),
     backbone=dict(
         type='SIR',
         num_blocks=3,
-        in_channels=[116 + 64,] + [133, ] * 2,
+        in_channels=[243 - 64,] + [132, ] * 2,
         feat_channels=[[128, 128], ] * 3,
         rel_mlp_hidden_dims=[[16, 32],] * 3,
         norm_cfg=dict(type='LN', eps=1e-3),
@@ -125,17 +178,16 @@ model = dict(
     bbox_head=dict(
         type='SparseClusterHeadV2',
         num_classes=num_classes,
-        bbox_coder=dict(type='BasePointBBoxCoder', code_size=10),
+        bbox_coder=dict(type='BasePointBBoxCoder', code_size=8),
         loss_cls=dict(
             type='FocalLoss',
             use_sigmoid=True,
-            gamma=4.0,
+            gamma=1.0,
             alpha=0.25,
-            loss_weight=1.0),
-        loss_center=dict(type='L1Loss', loss_weight=0.5),
-        loss_size=dict(type='L1Loss', loss_weight=0.5),
-        loss_rot=dict(type='L1Loss', loss_weight=0.2),
-        loss_vel=dict(type='L1Loss', loss_weight=0.2),
+            loss_weight=4.0),
+        loss_center=dict(type='SmoothL1Loss', loss_weight=0.25, beta=0.1),
+        loss_size=dict(type='SmoothL1Loss', loss_weight=0.25, beta=0.1),
+        loss_rot=dict(type='SmoothL1Loss', loss_weight=0.1, beta=0.1),
         in_channel=128 * 3 * 2,
         shared_mlp_dims=[1024, 1024],
         train_cfg=None,
@@ -144,7 +196,7 @@ model = dict(
         tasks=tasks,
         class_names=class_names,
         common_attrs=dict(
-            center=(3, 2, 128), dim=(3, 2, 128), rot=(2, 2, 128), vel=(2, 2, 128)  # (out_dim, num_layers, hidden_dim)
+            center=(3, 2, 128), dim=(3, 2, 128), rot=(2, 2, 128),
         ),
         num_cls_layer=2,
         cls_hidden_dim=128,
@@ -153,55 +205,60 @@ model = dict(
             norm_cfg=dict(type='LN'),
             act='gelu',
         ),
+
     ),
+    encode_2d_mlp_cfg=dict(
+                    in_channel=32,
+                    mlp_channel=[128, 128],
+                    norm_cfg=dict(type='LN', eps=1e-3),
+                    act='gelu',
+                ),
     
     train_cfg=dict(
         score_thresh=seg_score_thresh,
+        class_names=class_names, 
         sync_reg_avg_factor=True,
         pre_voxelization_size=(0.1, 0.1, 0.1),
-        disable_pretrain=False,
-        disable_pretrain_topks=[200, ] * 6,
         group_sample=True,
+        group_names=group_names,
         offset_weight='max',
         group_lens=group_lens,
-        class_names=class_names, 
-        group_names=[group1, group2, group3, group4, group5, group6],
     ),
     test_cfg=dict(
         score_thresh=seg_score_thresh,
+        class_names=class_names, 
         pre_voxelization_size=(0.1, 0.1, 0.1),
         group_sample=True,
+        group_names=group_names,
         offset_weight='max',
         group_lens=group_lens,
-        class_names=class_names, 
-        group_names=[group1, group2, group3, group4, group5, group6],
         use_rotate_nms=True,
         nms_pre=-1,
-        nms_thr=0.25, # from 0.25 to 0.7 for retest
-        score_thr=0.05, 
+        nms_thr=0.25,
+        score_thr=0.1, 
         min_bbox_size=0,
         max_num=500,
     ),
     cluster_assigner=dict(
         cluster_voxel_size = [
-            (0.3, 0.3, 8),
-            (0.3, 0.3, 8),
-            (0.3, 0.3, 8),
-            (0.1, 0.1, 8),
-            (0.2, 0.2, 8),
-            (0.05, 0.05, 8),
+            (0.3, 0.3, 6.4),
+            (0.05, 0.05, 6.4),
+            (0.08, 0.08, 6.4),
+            (0.5, 0.5, 6.4),
+            (0.1, 0.1, 6.4),
+            (0.08, 0.08, 6.4),
         ],
         min_points=2,
         point_cloud_range=point_cloud_range,
-        connected_dist=[0.6, 0.6, 0.6, 0.2, 0.4, 0.1],
+        connected_dist=[0.6, 0.1, 0.15, 1.0, 0.2, 0.15],
         class_names=class_names,
     ),
-
+    
     #Camera Query Generation
     frustum_sir=dict(
         type='SIR',
         num_blocks=3,
-        in_channels=[67 + 64 + 5,] + [133, ] * 2,
+        in_channels=[71,] + [132, ] * 2,
         feat_channels=[[128, 128], ] * 3,
         rel_mlp_hidden_dims=[[16, 32],] * 3,
         norm_cfg=dict(type='LN', eps=1e-3),
@@ -216,11 +273,11 @@ model = dict(
         num_classes=num_classes,
         bbox_coder=dict(
             type='BasePointBBoxCoder',
-            code_size=10,
+            code_size=8,
         ),
         assigner=dict(
             type='HybridAssigner',
-            num_cams=6,
+            num_cams=num_cams,
             assigner_2d=dict(
                 type='MaxIoUAssigner',
                 pos_iou_thr=0.7,
@@ -233,18 +290,16 @@ model = dict(
                 type='PointInBoxAssigner',
             ),
             class_names=class_names,
-            tasks=tasks,
         ),
         loss_cls=dict(
             type='FocalLoss',
             use_sigmoid=True,
-            gamma=4.0,
+            gamma=1.0,
             alpha=0.25,
-            loss_weight=1.0),
-        loss_center=dict(type='L1Loss', loss_weight=0.5),
-        loss_size=dict(type='L1Loss', loss_weight=0.5),
-        loss_rot=dict(type='L1Loss', loss_weight=0.2),
-        loss_vel=dict(type='L1Loss', loss_weight=0.2),
+            loss_weight=4.0),
+        loss_center=dict(type='SmoothL1Loss', loss_weight=0.25, beta=0.1),
+        loss_size=dict(type='SmoothL1Loss', loss_weight=0.25, beta=0.1),
+        loss_rot=dict(type='SmoothL1Loss', loss_weight=0.1, beta=0.1),
         in_channel=128 * 3 * 2 + 128,
         shared_mlp_dims=[1024, 1024],
         train_cfg=dict(),
@@ -254,7 +309,7 @@ model = dict(
             nms_thr=0.35,
             score_thr=0.01,
             min_bbox_size=0,
-            max_num=500,  #6 * 83 < 500
+            max_num=500,
         ),
         norm_cfg=dict(type='LN'),
         tasks=tasks,
@@ -262,8 +317,7 @@ model = dict(
         common_attrs=dict(
             center=(3, 2, 128), 
             dim=(3, 2, 128), 
-            rot=(2, 2, 128), 
-            vel=(2, 2, 128), # (out_dim, num_layers, hidden_dim)
+            rot=(2, 2, 128),
         ),
         num_cls_layer=2,
         cls_hidden_dim=128,
@@ -274,7 +328,6 @@ model = dict(
         ),
         as_rpn=False,
     ),
-
     #Query Refinement
     mlp_cfg=dict(
         embed_dims=1024,
@@ -285,7 +338,7 @@ model = dict(
     ),
     bbox_coder=dict(
             type='BasePointBBoxCoder',
-            code_size=10,
+            code_size=8,
     ),
     roi_extractor=dict(
                     type='DynamicPointROIExtractor',
@@ -295,9 +348,9 @@ model = dict(
                 ),
     single_refine_sir_layer=dict(
                     type='FullySparseBboxHead',
-                    num_classes=10,
+                    num_classes=num_classes,
                     num_blocks=3,
-                    in_channels=[67+5+13+32 + 64, 131+13+2, 131+13+2], 
+                    in_channels=[67+32+4+13, 130+13+2, 130+13+2], 
                     feat_channels=[[128, 128], ] * 3,
                     with_distance=False,
                     with_cluster_center=False,
@@ -323,11 +376,11 @@ model = dict(
             num_classes=num_classes,
             bbox_coder=dict(
                 type='BasePointBBoxCoder',
-                code_size=10,
+                code_size=8,
             ),
             assigner=dict(
                 type='FrustumAssigner',
-                num_cams=6,
+                num_cams=num_cams,
                 assigner_2d=dict(
                     type='MaxIoUAssigner',
                     pos_iou_thr=0.7,
@@ -340,47 +393,27 @@ model = dict(
                     type='PointInBoxAssigner',
                     extra_height = 0.0
                 ),
-                assigner_dist=dict(
-                    type='DistAssigner',
-                    assign_tasks = [
-                        dict(num_class=1, class_names=["car"]),
-                        dict(num_class=1, class_names=["truck",]),
-                        dict(num_class=1, class_names=["trailer"]),
-                        dict(num_class=1, class_names=["bus"]),
-                        dict(num_class=1, class_names=["construction_vehicle"]),
-                        dict(num_class=1, class_names=["bicycle"]),
-                        dict(num_class=1, class_names=["motorcycle"]),
-                        dict(num_class=1, class_names=["pedestrian"]),
-                        dict(num_class=1, class_names=["traffic_cone"]),
-                        dict(num_class=1, class_names=["barrier"]),
-                    ],
-                    ##          Car    truck  trailer bus   cv     bicycle motorcycle  pedestrian traffic_cone barrier
-                    max_dist = [[1.0], [1.0], [2.0], [4.0], [0.5], [0.5],  [0.5],      [0.5],     [0.5],       [0.0],],
-                    class_names=class_names,
-                ),
                 class_names=class_names,
                 tasks=tasks,
             ),
             loss_cls=dict(
                 type='FocalLoss',
                 use_sigmoid=True,
-                gamma=4.0,
+                gamma=1.0,
                 alpha=0.25,
-                loss_weight=2.0),
-            loss_center=dict(type='L1Loss', loss_weight=0.5),
-            loss_size=dict(type='L1Loss', loss_weight=0.5),
-            loss_rot=dict(type='L1Loss', loss_weight=0.2),
-            loss_vel=dict(type='L1Loss', loss_weight=0.2),
+                loss_weight=4.0),
+            loss_center=dict(type='SmoothL1Loss', loss_weight=0.25, beta=0.1),
+            loss_size=dict(type='SmoothL1Loss', loss_weight=0.25, beta=0.1),
+            loss_rot=dict(type='SmoothL1Loss', loss_weight=0.1, beta=0.1),
             in_channel=1024,
             shared_mlp_dims=[1024, 1024],
-
             test_cfg=dict(
                 use_rotate_nms=True,
                 nms_pre=-1,
                 nms_thr=0.35,
                 score_thr=0.01,
                 min_bbox_size=0,
-                max_num=500,  #6 * 83 < 500
+                max_num=500,
             ),
             norm_cfg=dict(type='LN'),
             tasks=tasks,
@@ -388,8 +421,7 @@ model = dict(
             common_attrs=dict(
                 center=(3, 2, 128), 
                 dim=(3, 2, 128), 
-                rot=(2, 2, 128), 
-                vel=(2, 2, 128), # (out_dim, num_layers, hidden_dim)
+                rot=(2, 2, 128),
             ),
             num_cls_layer=2,
             cls_hidden_dim=128,
@@ -402,28 +434,74 @@ model = dict(
         ),
     ],
     refine_encode_2d_mlp_cfg=dict(
-        in_channel=10, 
+        in_channel=32,
         mlp_channel=[32, 32],
         norm_cfg=dict(type='LN', eps=1e-3),
         act='gelu',
     ),
-    
 )
 
 # runtime settings
 runner = dict(type='EpochBasedRunner', max_epochs=6)
 evaluation = dict(interval=6)
 
+data = dict(
+    samples_per_gpu=1,
+    workers_per_gpu=4,
+    train=dict(
+        type='RepeatDataset',
+        times=1,
+        dataset=dict(
+            load_interval=1)
+    ),
+)
 log_config=dict(
     interval=20,
 )
 
+load_from='ckpt/fsd_argo_pretrain.pth'
+lr=1e-5
+
 optimizer = dict(
+    type='AdamW',
+    lr=lr,
+    betas=(0.9, 0.999),
+    weight_decay=0.05,
     paramwise_cfg=dict(
         custom_keys={
+            'norm': dict(decay_mult=0.),
             'segmentor.backbone': dict(lr_mult=0.2),
             'segmentor.voxel_encoder': dict(lr_mult=0.2),
         }),
 )
 
-load_from='ckpt/fsd_nusc_pretrain.pth'
+num_dict = {136393:'Bicycle',
+40137:'Bicyclist',
+429857:'Bollard',
+81933:'Bus',
+1486565:'Pedestrian',
+3795598:'Regular_vehicle',
+79169:'Sign',
+142649:'Stop_sign',
+36656:'Vehicular_trailer',
+3181:'Wheelchair',
+78851:'Box_truck',
+176099:'Construction_cone',
+109464:'Large_vehicle',
+38899:'Motorcycle',
+13442:'Motorcyclist',
+52754:'Truck',
+75804:'Wheeled_device',
+11174:'Dog',
+4069:'Mobile_pedestrian_crossing_sign',
+121998:'Construction_barrel',
+17116:'Truck_cab',
+10905:'School_bus',
+8170:'Stroller',
+10176:'Articulated_bus',
+8714:'Wheeled_rider',
+1119:'Official_signaler',
+1224:'Railed_vehicle',
+914:'Message_board_trailer',
+156:'Traffic_light_trailer',
+158:'Animal',}

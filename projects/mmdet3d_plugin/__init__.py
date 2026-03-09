@@ -14,6 +14,5 @@ from .models.necks import *
 from .models.roi_heads import *
 from .models.roi_heads.bbox_heads import *
 from .models.roi_heads.roi_extractors import *
-from .models.h_mamba import *
 from .models.utils import *
 from .ops import *

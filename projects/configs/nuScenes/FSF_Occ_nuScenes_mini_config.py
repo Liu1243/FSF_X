@@ -4,6 +4,11 @@ _base_ = [
     '../_base_/default_runtime.py',
 ]
 
+# ============================================================
+# FSF_Occ: Fully Sparse Fusion + Occupancy-Guided Amodal Completion
+# 在 FSF mini 配置基础上，添加 FrustumOccFilter 模块配置。
+# ============================================================
+
 plugin=True
 plugin_dir='projects/mmdet3d_plugin/'
 
@@ -29,6 +34,10 @@ group_names=[group1, group2, group3, group4, group5, group6]
 
 seg_score_thresh = [0.1, ] * 6
 group_lens = [len(group1), len(group2), len(group3), len(group4), len(group5), len(group6)]
+
+# FrustumOccFilter 中 in_channels 需与 seg_feats 维度一致：
+# VoteSegHead: 67 (seg_logits) + 64 (seg_feats) = 131
+_occ_filter_in_ch = 67 + 64   # = 131
 
 segmentor = dict(
     type='VoteSegmentor',
@@ -62,11 +71,11 @@ segmentor = dict(
         order=('conv', 'norm', 'act'),
         norm_cfg=dict(type='naiveSyncBN1d', eps=1e-3, momentum=0.01),
         base_channels=64,
-        output_channels=128, 
+        output_channels=128,
         encoder_channels=((128, ), (128, 128, 128), (128, 128, 128), (256, 256, 256), (512, 512, 512)),
         encoder_paddings=((1, ), (1, 1, 1), (1, 1, 1), ((0, 1, 1), 1, 1), (1, 1, 1)),
         decoder_channels=((512, 512, 256), (256, 256, 128), (128, 128, 128), (128, 128, 128), (128, 128, 128)),
-        decoder_paddings=((1, 1), (1, 0), (1, 0), (0, 0), (0, 1)), 
+        decoder_paddings=((1, 1), (1, 0), (1, 0), (0, 0), (0, 1)),
     ),
 
     decode_neck=dict(
@@ -87,7 +96,7 @@ segmentor = dict(
         loss_decode=dict(
             type='CrossEntropyLoss',
             use_sigmoid=False,
-            class_weight=[1.0, ] * num_classes + [0.1,], 
+            class_weight=[1.0, ] * num_classes + [0.1,],
             loss_weight=10.0),
         loss_vote=dict(
             type='L1Loss',
@@ -95,19 +104,40 @@ segmentor = dict(
     ),
     train_cfg=dict(
         point_loss=True,
-        score_thresh=seg_score_thresh, # for training log
-        class_names=class_names, # for training log
+        score_thresh=seg_score_thresh,
+        class_names=class_names,
         group_names=group_names,
         group_lens=group_lens,
     ),
 )
 
 model = dict(
-    type='FSF',
+    # ===== 关键改动：使用 FSF_Occ =====
+    type='FSF_Occ',
     num_classes=num_classes,
     num_cams=6,
     class_names=class_names,
 
+    # ===== FSF_Occ 新增：FrustumOccFilter 配置 =====
+    frustum_occ_filter_cfg=dict(
+        occ_mlp_cfg=dict(
+            in_channels=_occ_filter_in_ch,  # 131
+            hidden_dims=[64, 32],
+            norm_cfg=dict(type='LN', eps=1e-3),
+            act='gelu',
+        ),
+        amodal_head_cfg=dict(
+            in_channels=_occ_filter_in_ch,  # 131（MaxPool 后的实例特征维度）
+            hidden_dims=[64, 32],
+            norm_cfg=dict(type='LN', eps=1e-3),
+            act='gelu',
+        ),
+        occ_thr=0.3,           # 占据概率过滤阈值 τ
+        loss_occ_weight=1.0,   # λ1: L_occ 权重
+        loss_center_weight=0.5, # λ2: L_amodal_center 权重
+    ),
+
+    # ===== 以下与 FSF_nuScenes_mini_config.py 完全相同 =====
     #LiDAR Query Generation
     segmentor=segmentor,
     backbone=dict(
@@ -144,7 +174,7 @@ model = dict(
         tasks=tasks,
         class_names=class_names,
         common_attrs=dict(
-            center=(3, 2, 128), dim=(3, 2, 128), rot=(2, 2, 128), vel=(2, 2, 128)  # (out_dim, num_layers, hidden_dim)
+            center=(3, 2, 128), dim=(3, 2, 128), rot=(2, 2, 128), vel=(2, 2, 128)
         ),
         num_cls_layer=2,
         cls_hidden_dim=128,
@@ -154,7 +184,7 @@ model = dict(
             act='gelu',
         ),
     ),
-    
+
     train_cfg=dict(
         score_thresh=seg_score_thresh,
         sync_reg_avg_factor=True,
@@ -164,7 +194,7 @@ model = dict(
         group_sample=True,
         offset_weight='max',
         group_lens=group_lens,
-        class_names=class_names, 
+        class_names=class_names,
         group_names=[group1, group2, group3, group4, group5, group6],
     ),
     test_cfg=dict(
@@ -173,12 +203,12 @@ model = dict(
         group_sample=True,
         offset_weight='max',
         group_lens=group_lens,
-        class_names=class_names, 
+        class_names=class_names,
         group_names=[group1, group2, group3, group4, group5, group6],
         use_rotate_nms=True,
         nms_pre=-1,
-        nms_thr=0.25, # from 0.25 to 0.7 for retest
-        score_thr=0.05, 
+        nms_thr=0.25,
+        score_thr=0.05,
         min_bbox_size=0,
         max_num=500,
     ),
@@ -254,16 +284,16 @@ model = dict(
             nms_thr=0.35,
             score_thr=0.01,
             min_bbox_size=0,
-            max_num=500,  #6 * 83 < 500
+            max_num=500,
         ),
         norm_cfg=dict(type='LN'),
         tasks=tasks,
         class_names=class_names,
         common_attrs=dict(
-            center=(3, 2, 128), 
-            dim=(3, 2, 128), 
-            rot=(2, 2, 128), 
-            vel=(2, 2, 128), # (out_dim, num_layers, hidden_dim)
+            center=(3, 2, 128),
+            dim=(3, 2, 128),
+            rot=(2, 2, 128),
+            vel=(2, 2, 128),
         ),
         num_cls_layer=2,
         cls_hidden_dim=128,
@@ -280,7 +310,7 @@ model = dict(
         embed_dims=1024,
         norm_cfg=dict(type='LN', eps=1e-3),
         act='gelu',
-        lidar_img_input_dim=128 * 3 * 2 + 128, 
+        lidar_img_input_dim=128 * 3 * 2 + 128,
         lidar_input_dim=128 * 3 * 2,
     ),
     bbox_coder=dict(
@@ -297,7 +327,7 @@ model = dict(
                     type='FullySparseBboxHead',
                     num_classes=10,
                     num_blocks=3,
-                    in_channels=[67+5+13+32 + 64, 131+13+2, 131+13+2], 
+                    in_channels=[67+5+13+32 + 64, 131+13+2, 131+13+2],
                     feat_channels=[[128, 128], ] * 3,
                     with_distance=False,
                     with_cluster_center=False,
@@ -354,8 +384,7 @@ model = dict(
                         dict(num_class=1, class_names=["traffic_cone"]),
                         dict(num_class=1, class_names=["barrier"]),
                     ],
-                    ##          Car    truck  trailer bus   cv     bicycle motorcycle  pedestrian traffic_cone barrier
-                    max_dist = [[1.0], [1.0], [2.0], [4.0], [0.5], [0.5],  [0.5],      [0.5],     [0.5],       [0.0],],
+                    max_dist = [[1.0], [1.0], [2.0], [4.0], [0.5], [0.5],  [0.5],  [0.5],  [0.5],  [0.0],],
                     class_names=class_names,
                 ),
                 class_names=class_names,
@@ -373,23 +402,22 @@ model = dict(
             loss_vel=dict(type='L1Loss', loss_weight=0.2),
             in_channel=1024,
             shared_mlp_dims=[1024, 1024],
-
             test_cfg=dict(
                 use_rotate_nms=True,
                 nms_pre=-1,
                 nms_thr=0.35,
                 score_thr=0.01,
                 min_bbox_size=0,
-                max_num=500,  #6 * 83 < 500
+                max_num=500,
             ),
             norm_cfg=dict(type='LN'),
             tasks=tasks,
             class_names=class_names,
             common_attrs=dict(
-                center=(3, 2, 128), 
-                dim=(3, 2, 128), 
-                rot=(2, 2, 128), 
-                vel=(2, 2, 128), # (out_dim, num_layers, hidden_dim)
+                center=(3, 2, 128),
+                dim=(3, 2, 128),
+                rot=(2, 2, 128),
+                vel=(2, 2, 128),
             ),
             num_cls_layer=2,
             cls_hidden_dim=128,
@@ -402,12 +430,11 @@ model = dict(
         ),
     ],
     refine_encode_2d_mlp_cfg=dict(
-        in_channel=10, 
+        in_channel=10,
         mlp_channel=[32, 32],
         norm_cfg=dict(type='LN', eps=1e-3),
         act='gelu',
     ),
-    
 )
 
 # runtime settings

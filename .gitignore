@@ -127,3 +127,5 @@ mmdetection
 mmdetection3d
 ckpt
 data
+
+tmp
