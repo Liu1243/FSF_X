@@ -27,6 +27,7 @@ FSF_Occ: Fully Sparse Fusion with Occupancy-Guided Amodal Completion
 import torch
 from torch import nn
 from mmdet.models import DETECTORS
+from mmdet3d.core.bbox import bbox3d2result
 
 from .FSF import FSF
 from projects.mmdet3d_plugin.models.utils.frustum_occ_filter import FrustumOccFilter
@@ -407,9 +408,9 @@ class FSF_Occ(FSF):
 
         points, point_infos = self.split_points_last_3dim(points)
 
-        seg_out_tuple = self.segmentor(
-            points=points, img_metas=img_metas, as_subsegmentor=True, extract_feat_only=True
-        )
+        # 使用 segmentor.simple_test（而非直接调用 segmentor()）
+        # 直接调用 segmentor() 会因缺少 return_loss 参数而路由到 forward_train
+        seg_out_tuple = self.segmentor.simple_test(points, img_metas, extract_feat_only=True, rescale=False)
         seg_out_dict = self.segmentor_feat_inhance_test(seg_out_tuple, point_infos, mask_anno, mask_data, img_metas)
 
         pts_feat = seg_out_dict['seg_feats']
@@ -436,24 +437,14 @@ class FSF_Occ(FSF):
                 fsd_obj_centers, fsd_obj_coors, fsd_obj_result, fsd_obj_feats,
             )
 
-        if self.num_extra_stages > 0:
+        if self.num_extra_stages >= 0:
             bbox_list = self.multi_stage_refine_test(
                 obj_centers, obj_coors, obj_result, points_updated, point_infos,
                 pts_feat, batch_idx, mask_data, mask_anno, preds_2d, img_metas, obj_feats,
             )
-        else:
-            bbox_list = self.frustum_obj_head.get_bboxes(
-                frustum_obj_result['cls_logits'],
-                frustum_obj_result['reg_preds'],
-                frustum_preds_2d,
-                frustum_obj_centers,
-                frustum_obj_coors,
-                img_metas,
-                iou_logits=frustum_obj_result.get('iou_logits', None),
-            )
 
-        bbox_pts = [
-            self.bbox3d2result(bboxes, scores, labels)
+        bbox_results = [
+            bbox3d2result(bboxes, scores, labels)
             for bboxes, scores, labels in bbox_list
         ]
-        return [dict(pts_bbox=ret) for ret in bbox_pts]
+        return bbox_results
