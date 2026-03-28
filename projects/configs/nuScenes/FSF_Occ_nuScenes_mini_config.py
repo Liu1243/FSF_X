@@ -439,11 +439,15 @@ model = dict(
 
 # runtime settings
 runner = dict(type='EpochBasedRunner', max_epochs=6)
-evaluation = dict(interval=6)
+evaluation = dict(interval=6, save_best='pts_bbox_NuScenes/NDS', rule='greater')
 
 log_config=dict(
     interval=20,
 )
+
+custom_hooks = [
+    dict(type='SaveBestAsOptHook', metric='pts_bbox_NuScenes/NDS')
+]
 
 optimizer = dict(
     paramwise_cfg=dict(
