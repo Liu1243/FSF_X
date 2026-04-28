@@ -38,6 +38,7 @@ group_lens = [len(group1), len(group2), len(group3), len(group4), len(group5), l
 # FrustumOccFilter 中 in_channels 需与 seg_feats 维度一致：
 # VoteSegHead: 67 (seg_logits) + 64 (seg_feats) = 131
 _occ_filter_in_ch = 67 + 64   # = 131
+_completion_descriptor_dim = 8
 
 segmentor = dict(
     type='VoteSegmentor',
@@ -126,7 +127,13 @@ model = dict(
             norm_cfg=dict(type='LN', eps=1e-3),
             act='gelu',
         ),
-        amodal_head_cfg=dict(
+        refine_mlp_cfg=dict(
+            in_channels=_occ_filter_in_ch + 1,  # coarse score appended
+            hidden_dims=[64, 32],
+            norm_cfg=dict(type='LN', eps=1e-3),
+            act='gelu',
+        ),
+        completion_head_cfg=dict(
             in_channels=_occ_filter_in_ch,  # 131（MaxPool 后的实例特征维度）
             hidden_dims=[64, 32],
             norm_cfg=dict(type='LN', eps=1e-3),
@@ -135,6 +142,9 @@ model = dict(
         occ_thr=0.3,           # 占据概率过滤阈值 τ
         loss_occ_weight=1.0,   # λ1: L_occ 权重
         loss_center_weight=0.5, # λ2: L_amodal_center 权重
+        loss_size_weight=0.25,
+        loss_visibility_weight=0.25,
+        completion_descriptor_dim=_completion_descriptor_dim,
     ),
 
     # ===== 以下与 FSF_nuScenes_mini_config.py 完全相同 =====
@@ -275,7 +285,7 @@ model = dict(
         loss_size=dict(type='L1Loss', loss_weight=0.5),
         loss_rot=dict(type='L1Loss', loss_weight=0.2),
         loss_vel=dict(type='L1Loss', loss_weight=0.2),
-        in_channel=128 * 3 * 2 + 128,
+        in_channel=128 * 3 * 2 + 128 + _completion_descriptor_dim,
         shared_mlp_dims=[1024, 1024],
         train_cfg=dict(),
         test_cfg=dict(
@@ -310,7 +320,7 @@ model = dict(
         embed_dims=1024,
         norm_cfg=dict(type='LN', eps=1e-3),
         act='gelu',
-        lidar_img_input_dim=128 * 3 * 2 + 128,
+        lidar_img_input_dim=128 * 3 * 2 + 128 + _completion_descriptor_dim,
         lidar_input_dim=128 * 3 * 2,
     ),
     bbox_coder=dict(

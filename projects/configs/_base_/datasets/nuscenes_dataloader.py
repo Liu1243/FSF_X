@@ -1,6 +1,6 @@
 # dataset settings
 dataset_type = 'NuScenesDataset'
-data_root = 'data/nuscenes/'
+data_root = 'data/nuscenes/train/'
 file_client_args = dict(backend='disk')
 # Uncomment the following if use ceph or other file clients.
 # See https://mmcv.readthedocs.io/en/latest/api.html#mmcv.fileio.FileClient

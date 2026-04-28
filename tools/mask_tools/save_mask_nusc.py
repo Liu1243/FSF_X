@@ -20,7 +20,11 @@ def load_img_list(info):
     img_list = []
     for cam_name in info['cams'].keys():
         img_path = info['cams'][cam_name]['data_path']
+        img_path = img_path.replace('../FSF_X/data/nuscenes/train/', 'data/nuscenes/')
+        img_path = img_path.replace('../FSF_X/data/nuscenes/val/', 'data/nuscenes/')
         img = cv2.imread(img_path)
+        if img is None:
+            print(f"Warning: could not read {img_path}")
         img_list.append(img)
     return img_list
 
@@ -179,6 +183,14 @@ def save_data(model, args):
         if idx % args.num_gpus != args.split_id:
             continue
         info = infos[idx]
+        
+        # Checkpoint mechanism: Skip if already processed
+        sample_idx = info['token']
+        sample_dir = os.path.join(out_path, sample_idx) 
+        anno_path = os.path.join(sample_dir, 'anno.json')
+        if os.path.exists(anno_path):
+            continue
+
         img_list = load_img_list(info)
         result_list = inference_detector(model, img_list)          
 
@@ -196,10 +208,10 @@ if __name__ == "__main__":
     config ='projects/configs/_base_/nuimages/htc_x101_64x4d_fpn_dconv_c3-c5_coco-20e_16x1_20e_nuim.py'
     checkpoint = 'ckpt/htc_x101_64x4d_fpn_dconv_c3-c5_coco-20e_16x1_20e_nuim_20201008_211222-0b16ac4b.pth'
 
-    # info_path = f'data/nuscenes/nuscenes_infos_{args.split}.pkl'
-    # out_path = 'data/frustum_mask/nuScenes'
-    info_path = f'data/nuscenes_mini/nuscenes_infos_{args.split}.pkl'
-    out_path = 'data/frustum_mask/nuscenes_mini'
+    info_path = f'data/nuscenes/nuscenes_infos_{args.split}.pkl'
+    out_path = 'data/frustum_mask/nuScenes'
+    # info_path = f'data/nuscenes_mini/nuscenes_infos_{args.split}.pkl'
+    # out_path = 'data/frustum_mask/nuscenes_mini'
     os.makedirs(out_path, exist_ok=True)
 
     score_thre_init = 0.1

@@ -88,7 +88,13 @@ class FSF_Occ(FSF):
             norm_cfg=dict(type='LN', eps=1e-3),
             act='gelu',
         ))
-        amodal_head_cfg = frustum_occ_filter_cfg.get('amodal_head_cfg', dict(
+        refine_mlp_cfg = frustum_occ_filter_cfg.get('refine_mlp_cfg', dict(
+            in_channels=default_in_ch + 1,
+            hidden_dims=[64, 32],
+            norm_cfg=dict(type='LN', eps=1e-3),
+            act='gelu',
+        ))
+        completion_head_cfg = frustum_occ_filter_cfg.get('completion_head_cfg', dict(
             in_channels=default_in_ch,
             hidden_dims=[64, 32],
             norm_cfg=dict(type='LN', eps=1e-3),
@@ -97,11 +103,15 @@ class FSF_Occ(FSF):
 
         self.frustum_occ_filter = FrustumOccFilter(
             occ_mlp_cfg=occ_mlp_cfg,
-            amodal_head_cfg=amodal_head_cfg,
+            refine_mlp_cfg=refine_mlp_cfg,
+            completion_head_cfg=completion_head_cfg,
             occ_thr=frustum_occ_filter_cfg.get('occ_thr', 0.3),
             loss_occ_weight=frustum_occ_filter_cfg.get('loss_occ_weight', 1.0),
             loss_center_weight=frustum_occ_filter_cfg.get('loss_center_weight', 0.5),
+            loss_size_weight=frustum_occ_filter_cfg.get('loss_size_weight', 0.25),
+            loss_visibility_weight=frustum_occ_filter_cfg.get('loss_visibility_weight', 0.25),
         )
+        self.completion_descriptor_dim = frustum_occ_filter_cfg.get('completion_descriptor_dim', 8)
 
     # ---------------------------------------------------------------------- #
     #  辅助：获取 SIR 坐标并计算加权中心（供 OccFilter 调用前用）
@@ -226,7 +236,7 @@ class FSF_Occ(FSF):
             )
 
         # ---- FrustumOccFilter：占据过滤 + 非模态中心修正 ---- #
-        valid_mask, C_pred, occ_losses = self.frustum_occ_filter(
+        valid_mask, C_pred, occ_losses, completion_outputs, _ = self.frustum_occ_filter(
             pts_feat=pts_feat_fg,
             points=points_fg,
             sir_coors=sir_coors,
@@ -277,7 +287,10 @@ class FSF_Occ(FSF):
             img_h=mask_data.shape[-2],
             encode_mlp=self.encode_2d_mlp,
         )
-        lidar_img_feat = torch.cat([lidar_feat, img_feat], dim=-1)
+        completion_descriptor = completion_outputs.get('descriptor', None)
+        if completion_descriptor is None or completion_descriptor.shape[0] != lidar_feat.shape[0]:
+            completion_descriptor = lidar_feat.new_zeros((lidar_feat.shape[0], self.completion_descriptor_dim))
+        lidar_img_feat = torch.cat([lidar_feat, img_feat, completion_descriptor], dim=-1)
         obj_feat = lidar_img_feat
         frustum_obj_result = self.frustum_obj_head(obj_feat)
 

@@ -24,6 +24,54 @@ from mmcv.runner import BaseModule, force_fp32
 from projects.mmdet3d_plugin.ops import scatter_v2, build_mlp
 
 
+def ensure_minimum_points_per_instance(
+    instance_ids: torch.Tensor,
+    scores: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    """Guarantee each instance keeps at least one point after filtering."""
+    if instance_ids.numel() == 0:
+        return mask
+
+    kept = mask.clone()
+    for instance_id in torch.unique(instance_ids):
+        instance_mask = instance_ids == instance_id
+        if kept[instance_mask].any():
+            continue
+        local_scores = scores[instance_mask]
+        best_local = local_scores.argmax()
+        global_indices = instance_mask.nonzero(as_tuple=False).squeeze(-1)
+        kept[global_indices[best_local]] = True
+    return kept
+
+
+def build_completion_descriptor(
+    coarse_scores: torch.Tensor,
+    refine_scores: torch.Tensor,
+    instance_ids: torch.Tensor,
+    pred_size_residuals: torch.Tensor,
+    pred_visibility: torch.Tensor,
+    center_offsets: torch.Tensor,
+) -> torch.Tensor:
+    """Build compact per-instance descriptors for detector-side reuse."""
+    if instance_ids.numel() == 0:
+        return pred_size_residuals.new_zeros((0, 8))
+
+    descriptors = []
+    unique_instance_ids = torch.unique(instance_ids)
+    for row_idx, instance_id in enumerate(unique_instance_ids):
+        mask = instance_ids == instance_id
+        descriptors.append(torch.cat([
+            coarse_scores[mask].mean().reshape(1),
+            coarse_scores[mask].max().reshape(1),
+            refine_scores[mask].mean().reshape(1),
+            pred_size_residuals[row_idx],
+            pred_visibility[row_idx].reshape(1),
+            center_offsets[row_idx].norm().reshape(1),
+        ]))
+    return torch.stack(descriptors, dim=0)
+
+
 class OccMLP(BaseModule):
     """逐点占据概率预测网络（对应 SparseOcc 的 Sparsification 思想）。
 
@@ -66,13 +114,14 @@ class OccMLP(BaseModule):
         return occ_prob
 
 
-class AmodalCenterHead(BaseModule):
-    """实例级非模态中心偏移回归网络。
+class InstanceCompletionHead(BaseModule):
+    """实例级几何补全头。
 
     对每个视锥实例（每个 obj_id 对应一个实例），聚合有效占据点的特征，
-    回归出从观测中心 C_obs 到非模态中心 C_gt 的偏移量 Δc。
-
-    修正后的非模态中心：C_pred = C_obs + Δc
+    联合回归：
+        - 非模态中心偏移
+        - 尺度残差
+        - 可见率
 
     Args:
         in_channels (int): 输入特征维度（聚合后的实例特征维度）
@@ -88,15 +137,26 @@ class AmodalCenterHead(BaseModule):
         hidden_dims: list = [64, 32],
         norm_cfg: dict = dict(type='LN', eps=1e-3),
         act: str = 'gelu',
-        xyz_normalizer: list = [20.0, 20.0, 4.0],
     ):
         super().__init__()
-        self.xyz_normalizer = xyz_normalizer
 
-        # 输出 3 维偏移（x, y, z）
-        self.mlp = build_mlp(
+        self.center_mlp = build_mlp(
             in_channels,
             hidden_dims + [3],
+            norm_cfg,
+            is_head=True,
+            act=act,
+        )
+        self.size_mlp = build_mlp(
+            in_channels,
+            hidden_dims + [3],
+            norm_cfg,
+            is_head=True,
+            act=act,
+        )
+        self.visibility_mlp = build_mlp(
+            in_channels,
+            hidden_dims + [1],
             norm_cfg,
             is_head=True,
             act=act,
@@ -107,8 +167,8 @@ class AmodalCenterHead(BaseModule):
         pts_feat: torch.Tensor,
         sir_coors: torch.Tensor,
         valid_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """对每个实例内有效点做 MaxPool 聚合后回归偏移。
+    ):
+        """对每个实例内有效点做 MaxPool 聚合后回归补全量。
 
         Args:
             pts_feat (Tensor): (N, C) 全部点特征（未过滤）
@@ -117,14 +177,18 @@ class AmodalCenterHead(BaseModule):
 
         Returns:
             cluster_offsets (Tensor): (K, 3) 每个实例的中心偏移量
-            cluster_coors   (Tensor): (K, 3) 每个实例的 SIR 坐标
+            size_residuals (Tensor): (K, 3) 每个实例的尺度残差
+            visibility     (Tensor): (K,)   每个实例的可见率
+            cluster_coors  (Tensor): (K, 3) 每个实例的 SIR 坐标
         """
         # 只使用有效（前景）点做聚合
         if valid_mask.sum() == 0:
             # 边界情况：全部被过滤掉，回零偏移
             unique_coors = sir_coors.new_zeros((1, 3))
             offsets = pts_feat.new_zeros((1, 3))
-            return offsets, unique_coors
+            size_residuals = pts_feat.new_zeros((1, 3))
+            visibility = pts_feat.new_zeros(1)
+            return offsets, size_residuals, visibility, unique_coors
 
         valid_feat = pts_feat[valid_mask]       # (N_valid, C)
         valid_coors = sir_coors[valid_mask]     # (N_valid, 3)
@@ -135,8 +199,10 @@ class AmodalCenterHead(BaseModule):
         )
         # agg_feat: (K, C)  agg_coors: (K, 3)
 
-        cluster_offsets = self.mlp(agg_feat)    # (K, 3)
-        return cluster_offsets, agg_coors
+        cluster_offsets = self.center_mlp(agg_feat)    # (K, 3)
+        size_residuals = self.size_mlp(agg_feat)       # (K, 3)
+        visibility = self.visibility_mlp(agg_feat).squeeze(-1).sigmoid()  # (K,)
+        return cluster_offsets, size_residuals, visibility, agg_coors
 
 
 class FrustumOccFilter(BaseModule):
@@ -169,18 +235,43 @@ class FrustumOccFilter(BaseModule):
     def __init__(
         self,
         occ_mlp_cfg: dict,
-        amodal_head_cfg: dict,
+        refine_mlp_cfg: dict = None,
+        completion_head_cfg: dict = None,
+        amodal_head_cfg: dict = None,
         occ_thr: float = 0.3,
         loss_occ_weight: float = 1.0,
         loss_center_weight: float = 0.5,
+        loss_size_weight: float = 0.25,
+        loss_visibility_weight: float = 0.25,
     ):
         super().__init__()
         self.occ_thr = occ_thr
         self.loss_occ_weight = loss_occ_weight
         self.loss_center_weight = loss_center_weight
+        self.loss_size_weight = loss_size_weight
+        self.loss_visibility_weight = loss_visibility_weight
 
         self.occ_mlp = OccMLP(**occ_mlp_cfg)
-        self.amodal_center_head = AmodalCenterHead(**amodal_head_cfg)
+
+        if refine_mlp_cfg is None:
+            refine_mlp_cfg = dict(
+                in_channels=occ_mlp_cfg['in_channels'] + 1,
+                hidden_dims=occ_mlp_cfg.get('hidden_dims', [64, 32]),
+                norm_cfg=occ_mlp_cfg.get('norm_cfg', dict(type='LN', eps=1e-3)),
+                act=occ_mlp_cfg.get('act', 'gelu'),
+            )
+        if completion_head_cfg is None:
+            completion_head_cfg = amodal_head_cfg if amodal_head_cfg is not None else dict(
+                in_channels=occ_mlp_cfg['in_channels'],
+                hidden_dims=[64, 32],
+                norm_cfg=dict(type='LN', eps=1e-3),
+                act='gelu',
+            )
+
+        self.refine_mlp = OccMLP(**refine_mlp_cfg)
+        self.completion_head = InstanceCompletionHead(**completion_head_cfg)
+        # Backward-compatible alias for existing comments/call sites.
+        self.amodal_center_head = self.completion_head
 
     # ---------------------------------------------------------------------- #
     #  GT 生成辅助函数
@@ -272,19 +363,77 @@ class FrustumOccFilter(BaseModule):
     #  损失计算
     # ---------------------------------------------------------------------- #
 
-    @force_fp32(apply_to=('occ_prob', 'pred_offsets'))
+    @torch.no_grad()
+    def get_completion_gt(
+        self,
+        obs_centers: torch.Tensor,
+        cluster_coors: torch.Tensor,
+        batch_idx_centers: torch.Tensor,
+        gt_bboxes_3d_list: list,
+        points: torch.Tensor,
+        sir_coors: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ):
+        """Construct weak completion targets for center, size and visibility."""
+        K = obs_centers.shape[0]
+        center_gt = obs_centers.new_zeros((K, 3))
+        size_gt = obs_centers.new_zeros((K, 3))
+        visibility_gt = obs_centers.new_zeros(K)
+        valid_completion_mask = obs_centers.new_zeros(K, dtype=torch.bool)
+
+        if K == 0:
+            return center_gt, size_gt, visibility_gt, valid_completion_mask
+
+        for k in range(K):
+            bidx = int(batch_idx_centers[k].item())
+            if bidx >= len(gt_bboxes_3d_list):
+                continue
+            gt_bboxes = gt_bboxes_3d_list[bidx]
+            if len(gt_bboxes) == 0:
+                continue
+
+            gt_centers = gt_bboxes.gravity_center.to(obs_centers.device)
+            dists = torch.cdist(obs_centers[k:k + 1, :2], gt_centers[:, :2]).squeeze(0)
+            min_dist, gt_ind = dists.min(dim=0)
+            if min_dist >= 4.0:
+                continue
+
+            center_gt[k] = gt_centers[gt_ind] - obs_centers[k]
+
+            instance_mask = (sir_coors == cluster_coors[k]).all(dim=1)
+            pts_inst = points[instance_mask][:, :3]
+            if pts_inst.shape[0] > 0:
+                obs_extent = (pts_inst.max(dim=0).values - pts_inst.min(dim=0).values).clamp(min=1e-2)
+                gt_dims = gt_bboxes.tensor[gt_ind, 3:6].to(obs_centers.device).clamp(min=1e-2)
+                size_gt[k] = torch.log(gt_dims / obs_extent)
+
+                visible_points = valid_mask[instance_mask].float().sum()
+                total_points = float(max(int(instance_mask.sum().item()), 1))
+                visibility_gt[k] = visible_points / total_points
+            valid_completion_mask[k] = True
+
+        return center_gt, size_gt, visibility_gt, valid_completion_mask
+
+    @force_fp32(apply_to=('coarse_occ_prob', 'refine_occ_prob', 'pred_offsets', 'pred_size_residuals', 'pred_visibility'))
     def compute_losses(
         self,
-        occ_prob: torch.Tensor,
+        coarse_occ_prob: torch.Tensor,
+        refine_occ_prob: torch.Tensor,
         occ_gt: torch.Tensor,
         pred_offsets: torch.Tensor,
         center_gt: torch.Tensor,
         valid_center_mask: torch.Tensor,
+        pred_size_residuals: torch.Tensor,
+        size_gt: torch.Tensor,
+        pred_visibility: torch.Tensor,
+        visibility_gt: torch.Tensor,
+        valid_completion_mask: torch.Tensor,
     ) -> dict:
-        """计算占据损失和非模态中心回归损失。
+        """计算 coarse/refine occupancy 与实例级补全损失。
 
         Args:
-            occ_prob   (N,)   : 占据概率预测值
+            coarse_occ_prob (N,) : coarse 占据概率预测值
+            refine_occ_prob (N,) : refine 占据概率预测值
             occ_gt     (N,)   : 占据 GT 标签 (0/1)
             pred_offsets (K, 3): 预测中心偏移
             center_gt  (K, 3) : GT 中心偏移
@@ -297,12 +446,18 @@ class FrustumOccFilter(BaseModule):
 
         # ---- L_occ: Binary Cross-Entropy + Focal-style 权重 ---- #
         alpha, gamma = 0.25, 2.0
-        bce = F.binary_cross_entropy(occ_prob, occ_gt, reduction='none')
-        pt = occ_prob * occ_gt + (1 - occ_prob) * (1 - occ_gt)
+        bce_coarse = F.binary_cross_entropy(coarse_occ_prob, occ_gt, reduction='none')
+        pt_coarse = coarse_occ_prob * occ_gt + (1 - coarse_occ_prob) * (1 - occ_gt)
         focal_weight = alpha * occ_gt + (1 - alpha) * (1 - occ_gt)
-        focal_weight = focal_weight * (1 - pt).pow(gamma)
-        loss_occ = (bce * focal_weight).mean()
-        losses['loss_occ'] = self.loss_occ_weight * loss_occ
+        focal_weight_coarse = focal_weight * (1 - pt_coarse).pow(gamma)
+        loss_occ_coarse = (bce_coarse * focal_weight_coarse).mean()
+        losses['loss_occ_coarse'] = self.loss_occ_weight * loss_occ_coarse
+
+        bce_refine = F.binary_cross_entropy(refine_occ_prob, occ_gt, reduction='none')
+        pt_refine = refine_occ_prob * occ_gt + (1 - refine_occ_prob) * (1 - occ_gt)
+        focal_weight_refine = focal_weight * (1 - pt_refine).pow(gamma)
+        loss_occ_refine = (bce_refine * focal_weight_refine).mean()
+        losses['loss_occ_refine'] = self.loss_occ_weight * loss_occ_refine
 
         # ---- L_amodal_center: Smooth-L1 ---- #
         if valid_center_mask.sum() > 0:
@@ -312,6 +467,26 @@ class FrustumOccFilter(BaseModule):
         else:
             loss_center = pred_offsets.sum() * 0.0
         losses['loss_amodal_center'] = self.loss_center_weight * loss_center
+
+        if valid_completion_mask.sum() > 0:
+            loss_size = F.smooth_l1_loss(
+                pred_size_residuals[valid_completion_mask],
+                size_gt[valid_completion_mask],
+                reduction='mean',
+                beta=1.0,
+            )
+            loss_visibility = F.smooth_l1_loss(
+                pred_visibility[valid_completion_mask],
+                visibility_gt[valid_completion_mask],
+                reduction='mean',
+                beta=1.0,
+            )
+        else:
+            loss_size = pred_size_residuals.sum() * 0.0
+            loss_visibility = pred_visibility.sum() * 0.0
+
+        losses['loss_amodal_size'] = self.loss_size_weight * loss_size
+        losses['loss_visibility'] = self.loss_visibility_weight * loss_visibility
 
         return losses
 
@@ -343,17 +518,21 @@ class FrustumOccFilter(BaseModule):
             C_pred        (K, 3)      : 修正后的非模态中心
             occ_losses    dict or {}  : 训练时含 loss_occ + loss_amodal_center
         """
-        # ---- Step 1: 逐点占据概率预测 ---- #
-        occ_prob = self.occ_mlp(pts_feat)              # (N,)
-        valid_mask = occ_prob > self.occ_thr            # (N,) bool
+        # ---- Step 1: coarse-to-fine 占据概率预测 ---- #
+        coarse_occ_prob = self.occ_mlp(pts_feat)                  # (N,)
+        refine_input = torch.cat([pts_feat, coarse_occ_prob.unsqueeze(-1)], dim=-1)
+        refine_occ_prob = self.refine_mlp(refine_input)           # (N,)
 
-        # 若全部被过滤，保留所有点（避免空 tensor 崩溃）
-        if valid_mask.sum() == 0:
-            valid_mask = torch.ones_like(valid_mask, dtype=torch.bool)
+        instance_ids = sir_coors[:, -1]
+        valid_mask = refine_occ_prob > self.occ_thr
+        valid_mask = ensure_minimum_points_per_instance(
+            instance_ids=instance_ids,
+            scores=refine_occ_prob,
+            mask=valid_mask,
+        )
 
-        # ---- Step 2: 非模态中心偏移回归 ---- #
-        # 仅对有效点聚合得到实例级特征，然后回归偏移
-        pred_offsets, agg_coors = self.amodal_center_head(
+        # ---- Step 2: 实例级补全量回归 ---- #
+        pred_offsets, pred_size_residuals, pred_visibility, agg_coors = self.completion_head(
             pts_feat, sir_coors, valid_mask
         )
         # agg_coors: (K, 3)  (与 obs_centers 对应的实例顺序可能不同，需对齐)
@@ -369,34 +548,65 @@ class FrustumOccFilter(BaseModule):
             # K 不匹配时（边界情况），直接用观测中心兜底
             C_pred = obs_centers
 
+        completion_outputs = dict(
+            center_offsets=pred_offsets,
+            size_residuals=pred_size_residuals,
+            visibility=pred_visibility,
+            agg_coors=agg_coors,
+            descriptor=build_completion_descriptor(
+                coarse_scores=coarse_occ_prob,
+                refine_scores=refine_occ_prob,
+                instance_ids=instance_ids,
+                pred_size_residuals=pred_size_residuals,
+                pred_visibility=pred_visibility,
+                center_offsets=pred_offsets,
+            ),
+        )
+        score_dict = dict(
+            coarse_occ_prob=coarse_occ_prob,
+            refine_occ_prob=refine_occ_prob,
+        )
+
         # ---- Step 3: 训练时计算损失 ---- #
         occ_losses = {}
         if gt_bboxes_3d_list is not None and self.training:
             # 3a. 生成 OccGT
             occ_gt = self.get_occ_gt(points, batch_idx, gt_bboxes_3d_list)
 
-            # 3b. 获取 obs_centers 对应的 batch_idx
-            # obs_centers 与 agg_coors 的 batch_id 在第 0 列
-            # 使用有效点 sir_coors 散射后得到的 agg_coors batch 列
+            # 3b. 获取 completion GT
             if K_pred == K_obs:
                 batch_idx_centers = agg_coors[:, 0]
+                center_gt, size_gt, visibility_gt, valid_completion_mask = self.get_completion_gt(
+                    obs_centers=obs_centers,
+                    cluster_coors=agg_coors,
+                    batch_idx_centers=batch_idx_centers,
+                    gt_bboxes_3d_list=gt_bboxes_3d_list,
+                    points=points,
+                    sir_coors=sir_coors,
+                    valid_mask=valid_mask,
+                )
+                valid_center_mask = valid_completion_mask
             else:
                 batch_idx_centers = batch_idx.new_zeros(K_obs)
+                center_gt = obs_centers.new_zeros((K_obs, 3))
+                size_gt = obs_centers.new_zeros((K_obs, 3))
+                visibility_gt = obs_centers.new_zeros(K_obs)
+                valid_center_mask = obs_centers.new_zeros(K_obs, dtype=torch.bool)
+                valid_completion_mask = obs_centers.new_zeros(K_obs, dtype=torch.bool)
 
-            # 3c. 生成 AmodalCenterGT
-            center_gt, valid_center_mask = self.get_amodal_center_gt(
-                obs_centers,
-                agg_coors,
-                batch_idx_centers,
-                gt_bboxes_3d_list,
-            )
-
-            # 3d. 计算损失
+            # 3c. 计算损失
             occ_losses = self.compute_losses(
-                occ_prob, occ_gt,
-                pred_offsets if K_pred == K_obs else pred_offsets.new_zeros(K_obs, 3),
-                center_gt,
-                valid_center_mask,
+                coarse_occ_prob=coarse_occ_prob,
+                refine_occ_prob=refine_occ_prob,
+                occ_gt=occ_gt,
+                pred_offsets=pred_offsets if K_pred == K_obs else pred_offsets.new_zeros((K_obs, 3)),
+                center_gt=center_gt,
+                valid_center_mask=valid_center_mask,
+                pred_size_residuals=pred_size_residuals if K_pred == K_obs else pred_size_residuals.new_zeros((K_obs, 3)),
+                size_gt=size_gt,
+                pred_visibility=pred_visibility if K_pred == K_obs else pred_visibility.new_zeros(K_obs),
+                visibility_gt=visibility_gt,
+                valid_completion_mask=valid_completion_mask,
             )
 
-        return valid_mask, C_pred, occ_losses
+        return valid_mask, C_pred, occ_losses, completion_outputs, score_dict
