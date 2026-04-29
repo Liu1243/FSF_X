@@ -132,12 +132,29 @@ def serialize_hilbert(centers, batch_ids, num_rotations=2, num_bits=10):
 class ForegroundTokenSelector(nn.Module):
     """Deterministic foreground scoring plus per-batch top-k selection."""
 
-    def __init__(self, d_model, keep_ratio=0.75, min_tokens=8, min_per_modality=1):
+    def __init__(
+        self,
+        d_model,
+        keep_ratio=0.75,
+        min_tokens=8,
+        min_per_modality=1,
+        class_groups=None,
+        class_group_min_tokens=None,
+    ):
         super().__init__()
         hidden = max(16, d_model // 4)
         self.keep_ratio = keep_ratio
         self.min_tokens = min_tokens
         self.min_per_modality = min_per_modality
+        self.class_groups = [] if class_groups is None else [tuple(group) for group in class_groups]
+        if class_group_min_tokens is None:
+            self.class_group_min_tokens = [0] * len(self.class_groups)
+        elif isinstance(class_group_min_tokens, int):
+            self.class_group_min_tokens = [class_group_min_tokens] * len(self.class_groups)
+        else:
+            self.class_group_min_tokens = list(class_group_min_tokens)
+        if len(self.class_group_min_tokens) != len(self.class_groups):
+            raise ValueError("class_group_min_tokens must match class_groups length")
 
         self.score_refine = nn.Sequential(
             nn.LayerNorm(d_model),
@@ -177,6 +194,41 @@ class ForegroundTokenSelector(nn.Module):
         refined = 0.05 * torch.tanh(self.score_refine(features).squeeze(-1))
         return 0.60 * cls_score + 0.10 * feature_score + 0.25 * img_score + 0.05 * valid_flag + refined
 
+    def _apply_class_group_quotas(self, keep, batch_logits):
+        if not self.class_groups or batch_logits is None or batch_logits.numel() == 0:
+            return keep
+
+        num_classes = batch_logits.size(-1)
+        probs = torch.sigmoid(batch_logits)
+        for group, min_tokens in zip(self.class_groups, self.class_group_min_tokens):
+            if min_tokens <= 0:
+                continue
+            valid_classes = [class_idx for class_idx in group if 0 <= class_idx < num_classes]
+            if not valid_classes:
+                continue
+
+            class_indices = torch.tensor(valid_classes, device=batch_logits.device, dtype=torch.long)
+            pred_classes = probs.argmax(dim=-1)
+            group_members = (pred_classes.unsqueeze(-1) == class_indices.unsqueeze(0)).any(dim=-1)
+            existing = int((keep & group_members).sum().item())
+            deficit = int(min_tokens) - existing
+            if deficit <= 0:
+                continue
+
+            available_indices = ((~keep) & group_members).nonzero(as_tuple=False).squeeze(-1)
+            if available_indices.numel() == 0:
+                continue
+
+            group_scores = probs.index_select(1, class_indices).amax(dim=-1)
+            quota = min(deficit, available_indices.numel())
+            _, local_idx = torch.topk(
+                group_scores.index_select(0, available_indices),
+                k=quota,
+                sorted=False,
+            )
+            keep[available_indices.index_select(0, local_idx)] = True
+        return keep
+
     def forward(self, features, batch_ids, modality_ids, cls_logits=None, preds_2d=None):
         if features.numel() == 0:
             mask = batch_ids.new_zeros((0,), dtype=torch.bool)
@@ -191,6 +243,9 @@ class ForegroundTokenSelector(nn.Module):
             batch_indices = batch_mask.nonzero(as_tuple=False).squeeze(-1)
             batch_scores = scores.index_select(0, batch_indices)
             batch_modalities = modality_ids.index_select(0, batch_indices)
+            batch_logits = None
+            if cls_logits is not None and cls_logits.numel() > 0:
+                batch_logits = cls_logits.index_select(0, batch_indices)
 
             target = max(self.min_tokens, int(math.ceil(batch_indices.numel() * self.keep_ratio)))
             target = min(target, batch_indices.numel())
@@ -205,6 +260,8 @@ class ForegroundTokenSelector(nn.Module):
                     topk = min(self.min_per_modality, modality_indices.numel())
                     _, local_idx = torch.topk(batch_scores.index_select(0, modality_indices), k=topk, sorted=False)
                     keep[modality_indices.index_select(0, local_idx)] = True
+
+            keep = self._apply_class_group_quotas(keep, batch_logits)
 
             remaining = max(0, target - int(keep.sum().item()))
             if remaining > 0:
@@ -271,20 +328,33 @@ class HierarchicalHMambaInteraction(nn.Module):
         keep_ratio=0.75,
         min_tokens=8,
         min_per_modality=1,
+        class_groups=None,
+        class_group_min_tokens=None,
         num_rotations=2,
         window_size=32,
         use_fast_path=False,
+        use_extended_reliability=False,
+        small_object_class_indices=None,
+        small_object_residual_scale=0.1,
     ):
         super().__init__()
         self.d_model = d_model
         self.num_rotations = num_rotations
         self.window_size = window_size
+        self.use_extended_reliability = use_extended_reliability
+        self.descriptor_dim = 9 if use_extended_reliability else 6
+        self.small_object_class_indices = (
+            tuple() if small_object_class_indices is None else tuple(int(idx) for idx in small_object_class_indices)
+        )
+        self.small_object_residual_scale = small_object_residual_scale
 
         self.selector = ForegroundTokenSelector(
             d_model=d_model,
             keep_ratio=keep_ratio,
             min_tokens=min_tokens,
             min_per_modality=min_per_modality,
+            class_groups=class_groups,
+            class_group_min_tokens=class_group_min_tokens,
         )
 
         self.local_mamba = HMambaInteraction(
@@ -317,13 +387,24 @@ class HierarchicalHMambaInteraction(nn.Module):
             nn.GELU(),
             nn.Linear(d_model, d_model),
         )
-        self.reliability_fuser = ReliabilityGatedFusion(d_model=d_model, descriptor_dim=6)
+        self.reliability_fuser = ReliabilityGatedFusion(d_model=d_model, descriptor_dim=self.descriptor_dim)
         self.output_norm = nn.LayerNorm(d_model)
+        self.small_object_head = None
+        if self.small_object_class_indices:
+            self.small_object_head = nn.Sequential(
+                nn.LayerNorm(d_model),
+                nn.Linear(d_model, d_model),
+                nn.GELU(),
+                nn.Linear(d_model, d_model + 6),
+            )
 
         nn.init.zeros_(self.alignment_mlp[-1].weight)
         nn.init.zeros_(self.alignment_mlp[-1].bias)
         nn.init.zeros_(self.semantic_proj[-1].weight)
         nn.init.zeros_(self.semantic_proj[-1].bias)
+        if self.small_object_head is not None:
+            nn.init.zeros_(self.small_object_head[-1].weight)
+            nn.init.zeros_(self.small_object_head[-1].bias)
 
     def _run_mamba(self, module, seq_feat):
         if seq_feat.numel() == 0:
@@ -417,7 +498,7 @@ class HierarchicalHMambaInteraction(nn.Module):
 
     def _reliability_descriptors(self, centers, modality_ids, cls_logits=None, preds_2d=None):
         if centers.numel() == 0:
-            return centers.new_zeros((0, 6))
+            return centers.new_zeros((0, self.descriptor_dim))
 
         distance = centers.norm(dim=-1, keepdim=True)
         distance = distance / distance.max().clamp(min=1.0)
@@ -443,7 +524,29 @@ class HierarchicalHMambaInteraction(nn.Module):
             if preds_2d.size(-1) > 8:
                 valid_2d = preds_2d[:, 8:9].clamp(min=0.0, max=1.0)
 
-        return torch.cat([distance, modality, cls_conf, entropy, img_score, valid_2d], dim=-1)
+        base = torch.cat([distance, modality, cls_conf, entropy, img_score, valid_2d], dim=-1)
+        if not self.use_extended_reliability:
+            return base
+
+        range_conf = (1.0 - distance).clamp(min=0.0, max=1.0)
+        aspect_cue = distance.new_zeros((distance.size(0), 1))
+        if preds_2d is not None and preds_2d.numel() > 0 and preds_2d.size(-1) > 3:
+            box_w = (preds_2d[:, 2:3] - preds_2d[:, 0:1]).abs()
+            box_h = (preds_2d[:, 3:4] - preds_2d[:, 1:2]).abs().clamp(min=1e-3)
+            aspect_cue = (box_w / box_h).clamp(min=0.0, max=10.0) / 10.0
+        projection_consistency = (img_score * valid_2d).clamp(min=0.0, max=1.0)
+        return torch.cat([base, range_conf, aspect_cue, projection_consistency], dim=-1)
+
+    def _small_object_mask(self, cls_logits):
+        if self.small_object_head is None or cls_logits is None or cls_logits.numel() == 0:
+            return None
+        class_indices = torch.tensor(
+            self.small_object_class_indices,
+            device=cls_logits.device,
+            dtype=torch.long,
+        )
+        pred_classes = torch.sigmoid(cls_logits).argmax(dim=-1)
+        return (pred_classes.unsqueeze(-1) == class_indices.unsqueeze(0)).any(dim=-1)
 
     def forward(
         self,
@@ -463,6 +566,15 @@ class HierarchicalHMambaInteraction(nn.Module):
                 "log_var": features.new_zeros((0, 1)),
                 "restore_indices": batch_ids.new_zeros((0,), dtype=torch.long),
             }
+            if self.small_object_head is not None:
+                aux.update(
+                    {
+                        "small_object_mask": empty_mask,
+                        "small_object_pose_residual": features.new_zeros((0, 2)),
+                        "small_object_scale_residual": features.new_zeros((0, 3)),
+                        "small_object_temperature": features.new_zeros((0, 1)),
+                    }
+                )
             return features, aux
 
         selection = self.selector(
@@ -478,6 +590,10 @@ class HierarchicalHMambaInteraction(nn.Module):
         interacted = features.clone()
         gate = features.new_zeros((features.size(0), 1))
         log_var = features.new_zeros((features.size(0), 1))
+        small_object_mask = features.new_zeros((features.size(0),), dtype=torch.bool)
+        small_object_pose = features.new_zeros((features.size(0), 2))
+        small_object_scale = features.new_zeros((features.size(0), 3))
+        small_object_temperature = features.new_zeros((features.size(0), 1))
 
         if selected_indices.numel() > 0:
             sel_features = features.index_select(0, selected_indices)
@@ -527,6 +643,20 @@ class HierarchicalHMambaInteraction(nn.Module):
             fused_selected, gate_aux = self.reliability_fuser(sel_features, aggregated, descriptors)
             fused_selected = self.output_norm(fused_selected)
 
+            sel_small_mask = self._small_object_mask(sel_logits)
+            if sel_small_mask is not None:
+                small_raw = self.small_object_head(fused_selected)
+                feat_delta = small_raw[:, : self.d_model]
+                pose_delta = small_raw[:, self.d_model : self.d_model + 2]
+                scale_delta = small_raw[:, self.d_model + 2 : self.d_model + 5]
+                temperature = torch.sigmoid(small_raw[:, self.d_model + 5 : self.d_model + 6])
+                small_weight = sel_small_mask.float().unsqueeze(-1)
+                fused_selected = fused_selected + self.small_object_residual_scale * torch.tanh(feat_delta) * small_weight
+                small_object_mask.index_copy_(0, selected_indices, sel_small_mask)
+                small_object_pose.index_copy_(0, selected_indices, pose_delta * small_weight)
+                small_object_scale.index_copy_(0, selected_indices, scale_delta * small_weight)
+                small_object_temperature.index_copy_(0, selected_indices, temperature * small_weight)
+
             interacted.index_copy_(0, selected_indices, fused_selected)
             gate.index_copy_(0, selected_indices, gate_aux["gate"])
             log_var.index_copy_(0, selected_indices, gate_aux["log_var"])
@@ -538,4 +668,13 @@ class HierarchicalHMambaInteraction(nn.Module):
             "log_var": log_var,
             "restore_indices": torch.arange(features.size(0), device=features.device, dtype=torch.long),
         }
+        if self.small_object_head is not None:
+            aux.update(
+                {
+                    "small_object_mask": small_object_mask,
+                    "small_object_pose_residual": small_object_pose,
+                    "small_object_scale_residual": small_object_scale,
+                    "small_object_temperature": small_object_temperature,
+                }
+            )
         return interacted, aux

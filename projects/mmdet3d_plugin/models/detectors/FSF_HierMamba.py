@@ -26,9 +26,14 @@ class FSF_HierMamba(FSF):
             keep_ratio=cfg.get("keep_ratio", 0.75),
             min_tokens=cfg.get("min_tokens", 8),
             min_per_modality=cfg.get("min_per_modality", 1),
+            class_groups=cfg.get("class_groups", None),
+            class_group_min_tokens=cfg.get("class_group_min_tokens", None),
             num_rotations=cfg.get("num_rotations", 2),
             window_size=cfg.get("window_size", 32),
             use_fast_path=cfg.get("use_fast_path", False),
+            use_extended_reliability=cfg.get("use_extended_reliability", False),
+            small_object_class_indices=cfg.get("small_object_class_indices", None),
+            small_object_residual_scale=cfg.get("small_object_residual_scale", 0.1),
         )
 
     def _flatten_batched_tensor(self, batched_tensor, batch_ids):
