@@ -119,6 +119,33 @@ class HierarchicalHMambaTests(unittest.TestCase):
         self.assertTrue(output["mask"][3].item())
         self.assertEqual(int(output["mask"].sum().item()), 1)
 
+    def test_class_group_quota_falls_back_to_group_score_for_ambiguous_tokens(self):
+        selector = self.module.ForegroundTokenSelector(
+            d_model=8,
+            keep_ratio=0.25,
+            min_tokens=1,
+            min_per_modality=0,
+            class_groups=[[2]],
+            class_group_min_tokens=[1],
+        )
+        features = torch.zeros(4, 8)
+        batch_ids = torch.zeros(4, dtype=torch.long)
+        modality_ids = torch.zeros(4, dtype=torch.long)
+        cls_logits = torch.tensor(
+            [
+                [8.0, -8.0, -8.0],
+                [7.0, -7.0, -7.0],
+                [6.0, -6.0, -6.0],
+                [0.7, -6.0, 0.5],
+            ],
+            dtype=torch.float32,
+        )
+
+        output = selector(features, batch_ids, modality_ids, cls_logits=cls_logits)
+
+        self.assertTrue(output["mask"][3].item())
+        self.assertEqual(int(output["mask"].sum().item()), 1)
+
     def test_class_group_quota_counts_tokens_kept_by_modality_floor(self):
         selector = self.module.ForegroundTokenSelector(
             d_model=8,
@@ -262,6 +289,48 @@ class HierarchicalHMambaTests(unittest.TestCase):
         self.assertTrue(torch.equal(aux["restore_indices"].sort().values, torch.arange(8)))
         self.assertEqual(aux["selected_mask"].shape, (8,))
         self.assertEqual(aux["scores"].shape, (8,))
+
+    def test_cross_modal_alignment_uses_query_chunks(self):
+        model = self.module.HierarchicalHMambaInteraction(
+            d_model=8,
+            d_state=4,
+            expand_factor=1,
+            keep_ratio=1.0,
+            min_tokens=1,
+            num_rotations=1,
+            window_size=2,
+            use_fast_path=False,
+        )
+        model.alignment_chunk_size = 2
+        features = torch.randn(12, 8)
+        centers = torch.randn(12, 3)
+        batch_ids = torch.zeros(12, dtype=torch.long)
+        modality_ids = torch.tensor([0] * 6 + [1] * 6, dtype=torch.long)
+        cls_logits = torch.randn(12, 3)
+
+        original_cdist = self.module.torch.cdist
+        calls = []
+
+        def guarded_cdist(query, reference, *args, **kwargs):
+            calls.append((query.size(0), reference.size(0)))
+            if query.size(0) > model.alignment_chunk_size:
+                raise AssertionError("cross-modal alignment did not chunk cdist queries")
+            return original_cdist(query, reference, *args, **kwargs)
+
+        self.module.torch.cdist = guarded_cdist
+        try:
+            aligned = model._cross_modal_align(
+                features,
+                centers,
+                batch_ids,
+                modality_ids,
+                cls_logits=cls_logits,
+            )
+        finally:
+            self.module.torch.cdist = original_cdist
+
+        self.assertEqual(aligned.shape, features.shape)
+        self.assertGreater(len(calls), 2)
 
     def test_small_object_residual_head_reports_configured_tokens(self):
         model = self.module.HierarchicalHMambaInteraction(

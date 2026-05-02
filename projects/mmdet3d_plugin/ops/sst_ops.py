@@ -7,6 +7,8 @@ import torch_scatter
 from mmcv.cnn import build_norm_layer
 import traceback
 
+DEFAULT_SCATTER_FEATURE_CHUNK_SIZE = 32
+
 def scatter_nd(indices, updates, shape):
     """pytorch edition of tensorflow scatter_nd.
 
@@ -147,7 +149,42 @@ def flat2window_v2(feat, inds_dict, padding=0):
     batching_info = inds_dict['batching_info']
     return flat2window(feat, inds_dict['voxel_drop_level'], inds_v1, batching_info, padding=padding)
 
-def scatter_v2(feat, coors, mode, return_inv=True, min_points=0, unq_inv=None, new_coors=None):
+def _scatter_reduce(feat, index, mode, dim_size, feature_chunk_size=DEFAULT_SCATTER_FEATURE_CHUNK_SIZE):
+    if mode == 'max':
+        new_feat, argmax = torch_scatter.scatter_max(feat, index, dim=0, dim_size=dim_size)
+        return new_feat, argmax
+
+    if (
+        feature_chunk_size is not None
+        and feature_chunk_size > 0
+        and feat.dim() == 2
+        and feat.size(1) > feature_chunk_size
+    ):
+        new_feat = feat.new_empty((dim_size, feat.size(1)))
+        for start in range(0, feat.size(1), feature_chunk_size):
+            end = min(start + feature_chunk_size, feat.size(1))
+            new_feat[:, start:end] = torch_scatter.scatter(
+                feat[:, start:end],
+                index,
+                dim=0,
+                dim_size=dim_size,
+                reduce=mode,
+            )
+        return new_feat
+
+    return torch_scatter.scatter(feat, index, dim=0, dim_size=dim_size, reduce=mode)
+
+
+def scatter_v2(
+    feat,
+    coors,
+    mode,
+    return_inv=True,
+    min_points=0,
+    unq_inv=None,
+    new_coors=None,
+    feature_chunk_size=DEFAULT_SCATTER_FEATURE_CHUNK_SIZE,
+):
     assert feat.size(0) == coors.size(0)
     if mode == 'avg':
         mode = 'mean'
@@ -165,9 +202,21 @@ def scatter_v2(feat, coors, mode, return_inv=True, min_points=0, unq_inv=None, n
         new_coors, unq_inv, unq_cnt = torch.unique(coors, return_inverse=True, return_counts=True, dim=0)
 
     if mode == 'max':
-        new_feat, argmax = torch_scatter.scatter_max(feat, unq_inv, dim=0)
+        new_feat, argmax = _scatter_reduce(
+            feat,
+            unq_inv,
+            mode,
+            dim_size=new_coors.size(0),
+            feature_chunk_size=feature_chunk_size,
+        )
     elif mode in ('mean', 'sum'):
-        new_feat = torch_scatter.scatter(feat, unq_inv, dim=0, reduce=mode)
+        new_feat = _scatter_reduce(
+            feat,
+            unq_inv,
+            mode,
+            dim_size=new_coors.size(0),
+            feature_chunk_size=feature_chunk_size,
+        )
     else:
         raise NotImplementedError
 

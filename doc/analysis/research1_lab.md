@@ -16,6 +16,7 @@
 | baseline | `FSF_HierMamba_nuScenes_mini_config` | 原始 HierMamba 融合配置 | 0.5112 | 0.5424 | 0.7303 | 已完成 |
 | opt1 | `FSF_HierMamba_nuScenes_mini_config_opt` | 类别感知 token 保留、扩展 reliability descriptor、小目标残差增强 | 0.5284 | 0.5524 | 0.7548 | 已完成 |
 | opt2 | `FSF_HierMamba_nuScenes_mini_config_opt2` | mini-specific 类别配额收窄、类别配额缺口修正 | 0.5082 | 0.5335 | 0.7263 | 已完成，回退 |
+| opt3 | `FSF_HierMamba_nuScenes_mini_config_opt3` | soft quota fallback，保留 opt2 quota 修正并恢复模糊小目标 token 保护 | 待训练 | 待训练 | 待训练 | 代码已实现，待训练 |
 
 ## 实验 0: baseline
 
@@ -197,3 +198,89 @@ python tools/train.py projects/configs/nuScenes/FSF_HierMamba_nuScenes_mini_conf
 4. 小目标残差分支暂时不要继续加大强度。`bicycle` 的主要问题是 AOE 爆炸，应优先保护有效 token 和朝向监督信号，而不是扩大 residual scale。
 5. 若 opt3 后 `traffic_cone` ASE 仍高，再考虑对小目标尺寸残差增加类别条件化尺度先验；这个方向应放在 token 选择策略稳定之后。
 6. mini split 的无 GT 类别仍会影响官方 mAP，最终模型结论需要在 full nuScenes val 上复核。
+
+## 改进 3: soft quota fallback
+
+### 修改点
+
+- 保留 opt2 的 quota 缺口修正：`min_per_modality` 已经保留的目标类别 token 会计入 class group quota，避免重复抢占 token。
+- 将 opt2 的 hard class filter 改为两阶段 quota 填充：
+  - 第一阶段优先选择预测类别已经属于目标组 `[5,6,8]` 的 token。
+  - 若 quota 仍不足，第二阶段从剩余 token 中按 `max group score` 回退选择，保留训练早期分类不稳定但目标组响应较高的 bicycle/motorcycle/traffic_cone token。
+- 该改动直接针对 opt2 的失败根因：hard filter 依赖 argmax 类别，容易漏掉真实小目标的模糊候选，导致 `bicycle` AP 和 AOE 显著回退。
+- 新增单元测试 `test_class_group_quota_falls_back_to_group_score_for_ambiguous_tokens`，覆盖“目标组得分高但 argmax 不属于目标组”的候选 token 必须被 quota fallback 保留。
+
+### 当前验证
+
+```powershell
+C:\Users\1\miniconda3\envs\FSF\python.exe -m unittest tests.test_hierarchical_hmamba.HierarchicalHMambaTests.test_class_group_quota_falls_back_to_group_score_for_ambiguous_tokens tests.test_hierarchical_hmamba.HierarchicalHMambaTests.test_class_group_quota_counts_tokens_kept_by_modality_floor
+```
+
+结果：2 个针对性测试通过；随后运行 `tests.test_hierarchical_hmamba tests.test_hiermamba_configs tests.test_fsf_hiermamba_detector`，12 个相关单元测试通过。
+
+### 重新训练命令
+
+```powershell
+conda activate FSF
+$env:PYTHONPATH="$(Get-Location);$env:PYTHONPATH"
+python tools/train.py projects/configs/nuScenes/FSF_HierMamba_nuScenes_mini_config.py --work-dir work_dirs/nuScenes/FSF_HierMamba_nuScenes_mini_config_opt3 --cfg-options evaluation.jsonfile_prefix=work_dirs/nuScenes/FSF_HierMamba_nuScenes_mini_config_opt3/eval/results
+```
+
+### 实验 3 结果
+
+当前状态：待训练。
+
+| metric | opt1 | opt2 | opt3 | 期望 |
+| --- | ---: | ---: | ---: | --- |
+| mAP | 0.5284 | 0.5082 | 待训练 | 恢复到接近或超过 opt1 |
+| NDS | 0.5524 | 0.5335 | 待训练 | 恢复到接近或超过 opt1 |
+| present-class mAP | 0.7548 | 0.7263 | 待训练 | 恢复小目标收益 |
+| bicycle AP | 0.349 | 0.187 | 待训练 | 明显高于 opt2，目标接近 opt1 |
+| traffic_cone AP | 0.749 | 0.708 | 待训练 | 不低于 opt2，目标接近 opt1 |
+| mAOE | 0.5372 | 0.6065 | 待训练 | 降低，重点观察 bicycle AOE |
+
+### 训练启动问题与修复
+
+`2026-05-02 15:04` 启动 opt3 训练后，在第一个 train iter 的 `_cross_modal_align` 阶段发生 CUDA OOM：
+
+```text
+RuntimeError: CUDA out of memory ... hierarchical_hmamba.py, aligned.index_copy_(...)
+```
+
+根因分析：
+
+- `_cross_modal_align` 原实现对每个 batch 一次性构造完整 `cam x lidar` 的 `torch.cdist` 距离矩阵和语义相似度矩阵。
+- 最近邻匹配只用于离散路由，不需要梯度，但旧实现会把 `cls_logits` 的语义相似度计算纳入训练图，增加不必要的峰值显存和 autograd 保存。
+- 随后的 alignment MLP 也一次性处理全部 selected token，在 batch token 数较多时会进一步推高峰值显存。
+
+已修复：
+
+- 新增 `alignment_chunk_size=256`，跨模态最近邻按 query chunk 计算，避免一次性构造完整大矩阵。
+- 最近邻路由计算包在 `torch.no_grad()` 中，只保留 partner index；alignment MLP 仍对特征保持可导。
+- alignment MLP 同样按 chunk 计算并回写，降低 `align_input/align_delta` 峰值显存。
+- 新增 `test_cross_modal_alignment_uses_query_chunks`，确保大批量跨模态对齐时 `cdist` query 维度不会超过 chunk size。
+
+修复后继续使用同一 opt3 训练命令重跑即可。
+
+### 训练启动问题 2 与修复
+
+`2026-05-02 15:10` 重新启动训练后，在进入 HierMamba 之前，FSD 分支的预体素化阶段再次发生 CUDA OOM：
+
+```text
+FSF.py -> fsd_forward -> pre_voxelize -> scatter_v2
+RuntimeError: CUDA out of memory ... torch_scatter.scatter_mean ... Tried to allocate 248.00 MiB
+```
+
+根因分析：
+
+- 该 OOM 发生在 `scatter_v2(data, coors, mode='avg')`，位置早于 `combine_frustum_and_fsd`，因此不是 opt3 的 soft quota fallback 或跨模态对齐逻辑直接触发。
+- `scatter_v2` 已使用 `torch.unique(..., return_inverse=True)` 生成紧凑 `unq_inv`，不是明显的稀疏 index 编号错误。
+- 风险点在于 `torch_scatter.scatter_mean` 对高维特征一次性分配完整 `[num_voxels, feat_dim]` 输出，并额外构造 mean 计数张量；在 `seg_feats` 这类高维特征上容易形成短时峰值显存。
+
+已修复：
+
+- `scatter_v2` 显式向 `torch_scatter.scatter/scatter_max` 传入 `dim_size=new_coors.size(0)`，避免底层依赖 `index.max()+1` 推断输出尺寸。
+- 新增 `DEFAULT_SCATTER_FEATURE_CHUNK_SIZE=32`，当输入是二维高维特征且通道数超过 chunk size 时，按通道分块执行 scatter reduce，再写回输出切片。
+- 新增 `tests/test_sst_ops.py::test_scatter_v2_chunks_wide_feature_mean`，确保宽特征 mean scatter 会按通道分块并传入紧凑 `dim_size`。
+
+修复后继续使用同一 opt3 训练命令重跑；若仍出现 OOM，下一步再考虑将 mini 配置中的 `pre_voxelization_size` 从 `(0.1, 0.1, 0.1)` 放宽到 `(0.15, 0.15, 0.15)` 做显存兜底消融。

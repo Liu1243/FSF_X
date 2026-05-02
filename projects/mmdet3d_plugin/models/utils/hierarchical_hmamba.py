@@ -215,18 +215,32 @@ class ForegroundTokenSelector(nn.Module):
             if deficit <= 0:
                 continue
 
-            available_indices = ((~keep) & group_members).nonzero(as_tuple=False).squeeze(-1)
-            if available_indices.numel() == 0:
+            group_scores = probs.index_select(1, class_indices).amax(dim=-1)
+            hard_candidates = ((~keep) & group_members).nonzero(as_tuple=False).squeeze(-1)
+            if hard_candidates.numel() > 0:
+                quota = min(deficit, hard_candidates.numel())
+                _, local_idx = torch.topk(
+                    group_scores.index_select(0, hard_candidates),
+                    k=quota,
+                    sorted=False,
+                )
+                keep[hard_candidates.index_select(0, local_idx)] = True
+                deficit -= quota
+
+            if deficit <= 0:
                 continue
 
-            group_scores = probs.index_select(1, class_indices).amax(dim=-1)
-            quota = min(deficit, available_indices.numel())
+            fallback_candidates = (~keep).nonzero(as_tuple=False).squeeze(-1)
+            if fallback_candidates.numel() == 0:
+                continue
+
+            quota = min(deficit, fallback_candidates.numel())
             _, local_idx = torch.topk(
-                group_scores.index_select(0, available_indices),
+                group_scores.index_select(0, fallback_candidates),
                 k=quota,
                 sorted=False,
             )
-            keep[available_indices.index_select(0, local_idx)] = True
+            keep[fallback_candidates.index_select(0, local_idx)] = True
         return keep
 
     def forward(self, features, batch_ids, modality_ids, cls_logits=None, preds_2d=None):
@@ -336,12 +350,14 @@ class HierarchicalHMambaInteraction(nn.Module):
         use_extended_reliability=False,
         small_object_class_indices=None,
         small_object_residual_scale=0.1,
+        alignment_chunk_size=256,
     ):
         super().__init__()
         self.d_model = d_model
         self.num_rotations = num_rotations
         self.window_size = window_size
         self.use_extended_reliability = use_extended_reliability
+        self.alignment_chunk_size = int(alignment_chunk_size) if alignment_chunk_size is not None else 0
         self.descriptor_dim = 9 if use_extended_reliability else 6
         self.small_object_class_indices = (
             tuple() if small_object_class_indices is None else tuple(int(idx) for idx in small_object_class_indices)
@@ -443,6 +459,26 @@ class HierarchicalHMambaInteraction(nn.Module):
         )
         return self._run_mamba(self.global_mamba, local)
 
+    def _alignment_chunk(self, total):
+        if self.alignment_chunk_size <= 0:
+            return max(1, total)
+        return max(1, self.alignment_chunk_size)
+
+    def _nearest_cross_modal_indices(self, query_centers, reference_centers, query_probs=None, reference_probs=None):
+        if query_centers.numel() == 0 or reference_centers.numel() == 0:
+            return query_centers.new_zeros((query_centers.size(0),), dtype=torch.long)
+
+        chunk_size = self._alignment_chunk(query_centers.size(0))
+        nearest = []
+        for start in range(0, query_centers.size(0), chunk_size):
+            end = min(start + chunk_size, query_centers.size(0))
+            cost = torch.cdist(query_centers[start:end], reference_centers)
+            if query_probs is not None and reference_probs is not None:
+                semantic_similarity = query_probs[start:end].matmul(reference_probs.t()) / max(1, query_probs.size(-1))
+                cost = cost / (0.1 + semantic_similarity)
+            nearest.append(cost.argmin(dim=1))
+        return torch.cat(nearest, dim=0)
+
     def _cross_modal_align(self, features, centers, batch_ids, modality_ids, cls_logits=None):
         if features.size(0) == 0:
             return features
@@ -458,42 +494,60 @@ class HierarchicalHMambaInteraction(nn.Module):
             if cam_local.numel() == 0 or lid_local.numel() == 0:
                 continue
 
-            batch_centers = centers.index_select(0, batch_indices)
-            cost = torch.cdist(
-                batch_centers.index_select(0, cam_local),
-                batch_centers.index_select(0, lid_local),
-            )
+            with torch.no_grad():
+                batch_centers = centers.index_select(0, batch_indices).detach()
+                cam_centers = batch_centers.index_select(0, cam_local)
+                lid_centers = batch_centers.index_select(0, lid_local)
 
-            if cls_logits is not None and cls_logits.numel() > 0:
-                batch_probs = torch.sigmoid(cls_logits.index_select(0, batch_indices))
-                cam_probs = batch_probs.index_select(0, cam_local)
-                lid_probs = batch_probs.index_select(0, lid_local)
-                semantic_similarity = cam_probs.matmul(lid_probs.t()) / max(1, cam_probs.size(-1))
-                cost = cost / (0.1 + semantic_similarity)
+                cam_probs = None
+                lid_probs = None
+                if cls_logits is not None and cls_logits.numel() > 0:
+                    batch_probs = torch.sigmoid(cls_logits.index_select(0, batch_indices).detach())
+                    cam_probs = batch_probs.index_select(0, cam_local)
+                    lid_probs = batch_probs.index_select(0, lid_local)
 
-            cam_partner = lid_local.index_select(0, cost.argmin(dim=1))
-            lid_partner = cam_local.index_select(0, cost.argmin(dim=0))
+                cam_nearest = self._nearest_cross_modal_indices(
+                    cam_centers,
+                    lid_centers,
+                    query_probs=cam_probs,
+                    reference_probs=lid_probs,
+                )
+                lid_nearest = self._nearest_cross_modal_indices(
+                    lid_centers,
+                    cam_centers,
+                    query_probs=lid_probs,
+                    reference_probs=cam_probs,
+                )
 
-            partner_local = torch.arange(batch_indices.numel(), device=batch_indices.device)
-            partner_local[cam_local] = cam_partner
-            partner_local[lid_local] = lid_partner
+                cam_partner = lid_local.index_select(0, cam_nearest)
+                lid_partner = cam_local.index_select(0, lid_nearest)
+
+                partner_local = torch.arange(batch_indices.numel(), device=batch_indices.device)
+                partner_local[cam_local] = cam_partner
+                partner_local[lid_local] = lid_partner
 
             partner_global = batch_indices.index_select(0, partner_local)
-            self_feat = features.index_select(0, batch_indices)
-            partner_feat = features.index_select(0, partner_global)
-            rel_center = centers.index_select(0, batch_indices) - centers.index_select(0, partner_global)
+            chunk_size = self._alignment_chunk(batch_indices.numel())
+            for start in range(0, batch_indices.numel(), chunk_size):
+                end = min(start + chunk_size, batch_indices.numel())
+                chunk_indices = batch_indices[start:end]
+                chunk_partner = partner_global[start:end]
 
-            if cls_logits is not None and cls_logits.numel() > 0:
-                probs = torch.sigmoid(cls_logits.index_select(0, batch_indices))
-                partner_probs = torch.sigmoid(cls_logits.index_select(0, partner_global))
-                semantic_score = (probs * partner_probs).mean(dim=-1, keepdim=True)
-            else:
-                semantic_score = rel_center.new_zeros((rel_center.size(0), 1))
+                self_feat = features.index_select(0, chunk_indices)
+                partner_feat = features.index_select(0, chunk_partner)
+                rel_center = centers.index_select(0, chunk_indices) - centers.index_select(0, chunk_partner)
 
-            align_input = torch.cat([self_feat, partner_feat, rel_center, semantic_score], dim=-1)
-            align_delta = self.alignment_mlp(align_input)
-            align_weight = torch.exp(-rel_center.norm(dim=-1, keepdim=True))
-            aligned.index_copy_(0, batch_indices, self_feat + align_weight * align_delta)
+                if cls_logits is not None and cls_logits.numel() > 0:
+                    probs = torch.sigmoid(cls_logits.index_select(0, chunk_indices))
+                    partner_probs = torch.sigmoid(cls_logits.index_select(0, chunk_partner))
+                    semantic_score = (probs * partner_probs).mean(dim=-1, keepdim=True)
+                else:
+                    semantic_score = rel_center.new_zeros((rel_center.size(0), 1))
+
+                align_input = torch.cat([self_feat, partner_feat, rel_center, semantic_score], dim=-1)
+                align_delta = self.alignment_mlp(align_input)
+                align_weight = torch.exp(-rel_center.norm(dim=-1, keepdim=True))
+                aligned.index_copy_(0, chunk_indices, self_feat + align_weight * align_delta)
         return aligned
 
     def _reliability_descriptors(self, centers, modality_ids, cls_logits=None, preds_2d=None):
