@@ -15,7 +15,7 @@
 | --- | --- | --- | ---: | ---: | ---: | --- |
 | baseline | `FSF_HierMamba_nuScenes_mini_config` | 原始 HierMamba 融合配置 | 0.5112 | 0.5424 | 0.7303 | 已完成 |
 | opt1 | `FSF_HierMamba_nuScenes_mini_config_opt` | 类别感知 token 保留、扩展 reliability descriptor、小目标残差增强 | 0.5284 | 0.5524 | 0.7548 | 已完成 |
-| opt2 | `FSF_HierMamba_nuScenes_mini_config_opt2` | mini-specific 类别配额收窄、类别配额缺口修正 | 待训练 | 待训练 | 待训练 | 待训练 |
+| opt2 | `FSF_HierMamba_nuScenes_mini_config_opt2` | mini-specific 类别配额收窄、类别配额缺口修正 | 0.5082 | 0.5335 | 0.7263 | 已完成，回退 |
 
 ## 实验 0: baseline
 
@@ -152,22 +152,48 @@ python tools/train.py projects/configs/nuScenes/FSF_HierMamba_nuScenes_mini_conf
 
 ### 实验 2 结果
 
-当前状态：待训练。
+结果来源：`work_dirs/nuScenes/FSF_HierMamba_nuScenes_mini_config_opt2/eval/results`，评估时间 `2026-04-30 03:43`。
 
 | metric | opt1 | opt2 | 变化 |
 | --- | ---: | ---: | ---: |
-| mAP | 0.5284 | 待训练 | 待训练 |
-| NDS | 0.5524 | 待训练 | 待训练 |
-| present-class mAP | 0.7548 | 待训练 | 待训练 |
-| bicycle AP | 0.349 | 待训练 | 待训练 |
-| traffic_cone AP | 0.749 | 待训练 | 待训练 |
-| truck AP | 0.784 | 待训练 | 待训练 |
-| bus AP | 0.945 | 待训练 | 待训练 |
+| mAP | 0.5284 | 0.5082 | -0.0202 |
+| NDS | 0.5524 | 0.5335 | -0.0189 |
+| mATE | 0.4165 | 0.4234 | +0.0069 |
+| mASE | 0.4637 | 0.4730 | +0.0093 |
+| mAOE | 0.5372 | 0.6065 | +0.0693 |
+| mAVE | 0.3978 | 0.4056 | +0.0078 |
+| mAAE | 0.3027 | 0.2981 | -0.0046 |
+| present-class mAP | 0.7548 | 0.7263 | -0.0285 |
+
+### 实验 2 分类 AP 对比
+
+| class | baseline AP | opt1 AP | opt2 AP | opt2 vs opt1 |
+| --- | ---: | ---: | ---: | ---: |
+| car | 0.867 | 0.873 | 0.871 | -0.002 |
+| truck | 0.800 | 0.784 | 0.789 | +0.005 |
+| bus | 0.981 | 0.945 | 0.954 | +0.009 |
+| trailer | 0.000 | 0.000 | 0.000 | +0.000 |
+| construction_vehicle | 0.000 | 0.000 | 0.000 | +0.000 |
+| pedestrian | 0.906 | 0.904 | 0.909 | +0.005 |
+| motorcycle | 0.674 | 0.679 | 0.666 | -0.013 |
+| bicycle | 0.217 | 0.349 | 0.187 | -0.162 |
+| traffic_cone | 0.668 | 0.749 | 0.708 | -0.041 |
+| barrier | 0.000 | 0.000 | 0.000 | +0.000 |
+
+### 实验 2 结论
+
+- opt2 没有达到预期，应视为失败实验。mAP 比 opt1 下降 0.0202，NDS 下降 0.0189，present-class mAP 下降 0.0285，并且整体低于 baseline。
+- `truck/bus/pedestrian` 相比 opt1 有小幅恢复，说明 mini-specific 配额收窄确实减少了一部分非目标类干扰。
+- 主要失败点集中在小目标：`bicycle` AP 从 0.349 降到 0.187，低于 baseline 的 0.217；`traffic_cone` 从 0.749 降到 0.708，但仍高于 baseline；`motorcycle` 也小幅下降。
+- mAOE 从 0.5372 恶化到 0.6065，关键来自 `bicycle` AOE 达到 1.2782。说明当前改动破坏了 bicycle 的朝向建模，不只是检测数量下降。
+- 类别索引已确认无误：nuScenes mini 的类别顺序为 `car/truck/trailer/bus/construction_vehicle/bicycle/motorcycle/pedestrian/traffic_cone/barrier`，因此 `[5,6,8]` 确实对应 `bicycle/motorcycle/traffic_cone`。回退更可能来自 quota 选择策略，而不是类别索引写错。
+- 当前最可信的根因假设：opt2 的 quota 填充改成只从“预测类别已经属于 group”的 token 中选择。训练早期小目标分类置信度不稳定，真实 bicycle/traffic_cone token 容易被预测成相邻或背景类，导致这些 hard positive token 反而没有被保护。opt1 的宽松 group-score 选择虽然会带来 no-GT 类别噪声，但更容易保留模糊小目标 token，因此小目标 AP 更高。
 
 ## 后续优化优先级
 
-1. 先训练 opt2，确认 mini-specific 配额收窄是否能在保留 `bicycle/traffic_cone` 收益的同时恢复 `truck/bus`。
-2. 若 opt2 的 `bicycle` 仍明显弱于其他有效类，优先检查 bicycle 的朝向分支和正样本分配，而不是继续增加全局 token 数。
-3. 若 `traffic_cone` ASE 仍高，考虑对小目标尺寸残差分支增加更直接的监督或类别条件化尺度先验。
-4. 若 no-GT 类别预测数仍高，在 mini 实验中可单独加入类别先验校准或后处理阈值分析；最终结论仍应以 full nuScenes val 为准。
-
+1. 不建议继续沿用 opt2 作为主线。当前最佳结果仍是 opt1：mAP 0.5284，NDS 0.5524。
+2. 下一轮 opt3 建议采用 soft quota fallback：优先从预测类别属于 `[5,6,8]` 的 token 中补 quota；若 quota 不足，再回退到 group-score 最高的候选 token。这样保留 opt2 的配额缺口修正，同时避免训练早期因分类不准漏掉真实小目标 token。
+3. 做一个最小消融以隔离根因：保留 `_apply_class_group_quotas` 的“已保留 token 计入 quota”修正，但把 hard class filter 回退到 opt1 的 group-score 选择。如果该版本恢复 `bicycle/traffic_cone`，说明硬类别过滤是主要问题。
+4. 小目标残差分支暂时不要继续加大强度。`bicycle` 的主要问题是 AOE 爆炸，应优先保护有效 token 和朝向监督信号，而不是扩大 residual scale。
+5. 若 opt3 后 `traffic_cone` ASE 仍高，再考虑对小目标尺寸残差增加类别条件化尺度先验；这个方向应放在 token 选择策略稳定之后。
+6. mini split 的无 GT 类别仍会影响官方 mAP，最终模型结论需要在 full nuScenes val 上复核。
