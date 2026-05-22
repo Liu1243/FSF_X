@@ -92,6 +92,7 @@ class FSF(SingleStageFSD):
                 use_fsd=True,           # 是否使用LiDAR查询分支
                 voxel_downsampling_size=None,
                 is_argo=False,          # 是否为Argoverse2数据集（影响2D特征编码方式）
+                max_refine_queries=None,
                 ):
         super().__init__(
             backbone=backbone,
@@ -189,6 +190,7 @@ class FSF(SingleStageFSD):
         self.tta_test_cfg = tta_test_cfg
         self.voxel_downsampling_size = voxel_downsampling_size
         self.is_argo = is_argo
+        self.max_refine_queries = max_refine_queries
 
     def prj_points_2d(self, points, lidar2img, img_h, img_w):
         """将 LiDAR 点云投影到各相机图像上，获取归一化 2D 坐标。
@@ -212,7 +214,8 @@ class FSF(SingleStageFSD):
         depth_valid_mask = pts_2d[..., 2] > 1e-3
 
         # 透视除法：将齐次坐标转为像素坐标
-        pts_2d[..., 2] = torch.clip(pts_2d[..., 2], min=1e-5, max=1e5)
+        max_depth = torch.finfo(pts_2d.dtype).max
+        pts_2d[..., 2] = torch.clip(pts_2d[..., 2], min=1e-5, max=max_depth)
         pts_2d[..., 0] /= pts_2d[..., 2]  # u = X / Z
         pts_2d[..., 1] /= pts_2d[..., 2]  # v = Y / Z
 
@@ -242,8 +245,7 @@ class FSF(SingleStageFSD):
         obj_id_of_pts: 6, N
         """
 
-        mask_tensor = mask_data.float()
-        num_cams, num_classes, img_h, img_w = mask_tensor.shape
+        num_cams, num_classes, img_h, img_w = mask_data.shape
 
         #6, N, 2
         pts_2d = self.prj_points_2d(points, lidar2img, img_h, img_w)
@@ -251,7 +253,7 @@ class FSF(SingleStageFSD):
         obj_id_list = []
         for cam_id in range(num_cams):
             pts_2d_cam = pts_2d[cam_id].unsqueeze(0).unsqueeze(1)
-            mask_cam = mask_tensor[cam_id].unsqueeze(0)
+            mask_cam = mask_data[cam_id].to(dtype=pts_2d.dtype).unsqueeze(0)
             #mask_cam: 1, 10, 900, 1600
             #pts_2d_cam: 1, 1, N, 2
             obj_id_cam = F.grid_sample(mask_cam, pts_2d_cam, mode='nearest')
@@ -356,6 +358,69 @@ class FSF(SingleStageFSD):
         fg_mask = obj_id_tensor.sum((-2, -1)) > 0
         return pts_feat[fg_mask], bz_coor[fg_mask], points[fg_mask], \
             obj_id_tensor[fg_mask], point_fg_weights[fg_mask]
+
+    def limit_refine_queries(self, obj_centers, obj_coors, obj_result, obj_feats, preds_2d):
+        """Limit per-batch queries entering the memory-heavy refine ROI stage."""
+        max_queries = self.max_refine_queries
+        if max_queries is None or max_queries <= 0 or obj_coors.numel() == 0:
+            return obj_centers, obj_coors, obj_result, obj_feats, preds_2d
+
+        batch_values = obj_coors[:, 0].long()
+        batch_size = 0
+        if len(obj_result) > 0:
+            batch_size = len(next(iter(obj_result.values())))
+        batch_size = max(batch_size, int(batch_values.max().item()) + 1)
+
+        selected_global = []
+        selected_local_by_batch = []
+        score_lists = obj_result.get('cls_logits', None)
+
+        for bidx in range(batch_size):
+            batch_indices = (batch_values == bidx).nonzero(as_tuple=False).squeeze(-1)
+            if batch_indices.numel() == 0:
+                selected_local_by_batch.append(batch_indices)
+                continue
+
+            count = batch_indices.numel()
+            if score_lists is not None and bidx < len(score_lists) and score_lists[bidx].numel() > 0:
+                score_tensor = score_lists[bidx]
+                count = min(count, score_tensor.shape[0])
+                scores = torch.sigmoid(score_tensor[:count]).amax(dim=-1)
+            else:
+                scores = torch.arange(count, device=batch_indices.device, dtype=obj_feats.dtype)
+
+            if count > max_queries:
+                keep_local = torch.topk(scores, k=max_queries, largest=True, sorted=False).indices
+                keep_local = keep_local.sort()[0]
+            else:
+                keep_local = torch.arange(count, device=batch_indices.device, dtype=torch.long)
+
+            selected_local_by_batch.append(keep_local)
+            selected_global.append(batch_indices[:count].index_select(0, keep_local.to(device=batch_indices.device)))
+
+        if len(selected_global) == 0:
+            return obj_centers, obj_coors, obj_result, obj_feats, preds_2d
+
+        selected_global = torch.cat(selected_global, dim=0)
+        limited_result = {}
+        for key, values in obj_result.items():
+            limited_values = []
+            for bidx, value in enumerate(values):
+                if bidx < len(selected_local_by_batch):
+                    keep_local = selected_local_by_batch[bidx].to(device=value.device)
+                    keep_local = keep_local[keep_local < value.shape[0]]
+                    limited_values.append(value.index_select(0, keep_local))
+                else:
+                    limited_values.append(value)
+            limited_result[key] = limited_values
+
+        return (
+            obj_centers.index_select(0, selected_global.to(device=obj_centers.device)),
+            obj_coors.index_select(0, selected_global.to(device=obj_coors.device)),
+            limited_result,
+            obj_feats.index_select(0, selected_global.to(device=obj_feats.device)),
+            preds_2d.index_select(0, selected_global.to(device=preds_2d.device)),
+        )
 
     def map_voxel_center_to_point(self, voxel_mean, voxel2point_inds):
         return voxel_mean[voxel2point_inds]
@@ -985,6 +1050,9 @@ class FSF(SingleStageFSD):
                 fsd_obj_feats,
             )
 
+        obj_centers, obj_coors, obj_result, obj_feats, preds_2d = self.limit_refine_queries(
+            obj_centers, obj_coors, obj_result, obj_feats, preds_2d)
+
         if self.num_extra_stages > 0:
             multi_stage_losses = self.multi_stage_refine_train(obj_centers,
                                                     obj_coors,
@@ -1213,12 +1281,12 @@ class FSF(SingleStageFSD):
     def decode_stage_bboxes(self, obj_centers, bz_coors, reg_preds):
         batch_size = len(reg_preds)
         decode_size = reg_preds[0].shape[-1] - 1
-        bboxes_tensor = reg_preds[0].new_zeros((bz_coors.shape[0], decode_size))
+        bboxes_tensor = reg_preds[0].new_zeros((bz_coors.shape[0], decode_size), dtype=torch.float32)
         for bidx in range(batch_size):
             bz_mask = bz_coors == bidx
             bboxes_bz = self.bbox_coder.decode(reg_preds[bidx], obj_centers[bz_mask])
-            bboxes_tensor[bz_mask] = bboxes_bz
-        bboxes_tensor_roi = torch.cat([bz_coors.unsqueeze(-1), bboxes_tensor], dim=-1)
+            bboxes_tensor[bz_mask] = bboxes_bz.to(dtype=bboxes_tensor.dtype)
+        bboxes_tensor_roi = torch.cat([bz_coors.to(dtype=bboxes_tensor.dtype).unsqueeze(-1), bboxes_tensor], dim=-1)
         return bboxes_tensor_roi
 
     def forward_test(self,
@@ -1282,6 +1350,9 @@ class FSF(SingleStageFSD):
                 fsd_obj_result,
                 fsd_obj_feats,
             )
+
+        obj_centers, obj_coors, obj_result, obj_feats, preds_2d = self.limit_refine_queries(
+            obj_centers, obj_coors, obj_result, obj_feats, preds_2d)
             
         if self.num_extra_stages >= 0:
             bbox_list = self.multi_stage_refine_test(obj_centers,

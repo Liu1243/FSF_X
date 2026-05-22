@@ -60,6 +60,49 @@ class FrustumOccFilterTests(unittest.TestCase):
         )
         self.assertTrue(torch.equal(keep, torch.tensor([False, True, False, True])))
 
+    def test_instance_fallback_can_keep_topk_points_per_instance(self):
+        keep = self.module.ensure_minimum_points_per_instance(
+            instance_ids=torch.tensor([0, 0, 0, 1, 1, 1]),
+            scores=torch.tensor([0.1, 0.5, 0.3, 0.6, 0.2, 0.4]),
+            mask=torch.tensor([False, False, False, True, False, False]),
+            min_points=2,
+        )
+        self.assertTrue(torch.equal(keep, torch.tensor([False, True, True, True, False, True])))
+
+    def test_filter_uses_configured_min_points_per_instance(self):
+        filt = self.module.FrustumOccFilter(
+            occ_mlp_cfg=dict(in_channels=4, hidden_dims=[8]),
+            refine_mlp_cfg=dict(in_channels=5, hidden_dims=[8]),
+            completion_head_cfg=dict(in_channels=4, hidden_dims=[8]),
+            min_points_per_instance=2,
+        )
+        self.assertEqual(filt.min_points_per_instance, 2)
+
+    def test_instance_fallback_uses_class_specific_min_points(self):
+        keep = self.module.ensure_minimum_points_per_instance(
+            instance_ids=torch.tensor([0, 0, 0, 1, 1, 1]),
+            scores=torch.tensor([0.1, 0.5, 0.3, 0.6, 0.2, 0.4]),
+            mask=torch.tensor([False, False, False, False, False, False]),
+            min_points=1,
+            class_ids=torch.tensor([5, 5, 5, 0, 0, 0]),
+            class_min_points={5: 2},
+        )
+        self.assertTrue(torch.equal(keep, torch.tensor([False, True, True, True, False, False])))
+
+    def test_bev_orientation_cues_follow_instance_major_axis(self):
+        cues = self.module.compute_bev_orientation_cues(
+            points=torch.tensor([
+                [0.0, 0.0, 0.0],
+                [2.0, 0.0, 0.0],
+                [1.0, -1.0, 0.0],
+                [1.0, 1.0, 0.0],
+            ]),
+            instance_ids=torch.tensor([0, 0, 1, 1]),
+            valid_mask=torch.tensor([True, True, True, True]),
+        )
+        self.assertTrue(torch.allclose(cues[0], torch.tensor([1.0, 0.0]), atol=1e-4))
+        self.assertTrue(torch.allclose(cues[1], torch.tensor([0.0, 1.0]), atol=1e-4))
+
     def test_forward_returns_completion_outputs(self):
         filt = self.module.FrustumOccFilter(
             occ_mlp_cfg=dict(in_channels=4, hidden_dims=[8]),
@@ -75,6 +118,7 @@ class FrustumOccFilterTests(unittest.TestCase):
             gt_bboxes_3d_list=None,
         )
         self.assertEqual(len(outputs), 5)
+        self.assertEqual(outputs[3]["descriptor"].shape, (2, 10))
 
 
 if __name__ == "__main__":

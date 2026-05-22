@@ -46,10 +46,11 @@ class Voxel2PointScatterNeck(nn.Module):
             pts_coors = pts_coors[pts_mask]
             points = points[pts_mask]
 
-            voxel_size = torch.tensor(self.voxel_size, dtype=dtype, device=device).reshape(1,3)
-            pc_min_range = torch.tensor(self.point_cloud_range[:3], dtype=dtype, device=device).reshape(1,3)
-            voxel_center_each_pts = (pts_coors[:, [3,2,1]].to(dtype).to(device) + 0.5) * voxel_size + pc_min_range# x y z order
-            local_xyz = points[:, :3] - voxel_center_each_pts
+            coord_dtype = torch.float32
+            voxel_size = torch.tensor(self.voxel_size, dtype=coord_dtype, device=device).reshape(1,3)
+            pc_min_range = torch.tensor(self.point_cloud_range[:3], dtype=coord_dtype, device=device).reshape(1,3)
+            voxel_center_each_pts = (pts_coors[:, [3,2,1]].to(coord_dtype).to(device) + 0.5) * voxel_size + pc_min_range# x y z order
+            local_xyz = points[:, :3].to(coord_dtype) - voxel_center_each_pts
             if self.normalize_local_xyz:
                 local_xyz = local_xyz / (voxel_size / 2)
 
@@ -64,6 +65,7 @@ class Voxel2PointScatterNeck(nn.Module):
                     torch.save(points, 'points.pth')
                     torch.save(voxel_center_each_pts, 'voxel_center_each_pts.pth')
                     raise ValueError
+            local_xyz = local_xyz.to(dtype=pts_feats.dtype)
             results = torch.cat([pts_feats, local_xyz], 1)
         else:
             results = pts_feats[pts_mask]

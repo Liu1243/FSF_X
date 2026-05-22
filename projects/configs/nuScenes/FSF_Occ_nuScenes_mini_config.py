@@ -38,7 +38,7 @@ group_lens = [len(group1), len(group2), len(group3), len(group4), len(group5), l
 # FrustumOccFilter 中 in_channels 需与 seg_feats 维度一致：
 # VoteSegHead: 67 (seg_logits) + 64 (seg_feats) = 131
 _occ_filter_in_ch = 67 + 64   # = 131
-_completion_descriptor_dim = 8
+_completion_descriptor_dim = 10
 
 segmentor = dict(
     type='VoteSegmentor',
@@ -140,6 +140,8 @@ model = dict(
             act='gelu',
         ),
         occ_thr=0.3,           # 占据概率过滤阈值 τ
+        min_points_per_instance=1,
+        class_min_points_per_instance={5: 2, 6: 2, 8: 2},
         loss_occ_weight=1.0,   # λ1: L_occ 权重
         loss_center_weight=0.5, # λ2: L_amodal_center 权重
         loss_size_weight=0.25,

@@ -263,6 +263,42 @@ class HierarchicalHMambaTests(unittest.TestCase):
         self.assertEqual(aux["selected_mask"].shape, (8,))
         self.assertEqual(aux["scores"].shape, (8,))
 
+    def test_hierarchical_hmamba_aux_outputs_follow_feature_dtype(self):
+        class HalfAuxFuser(torch.nn.Module):
+            def forward(self, residual, interacted, descriptors):
+                gate = residual.new_full((residual.size(0), 1), 0.5).half()
+                log_var = residual.new_zeros((residual.size(0), 1)).half()
+                return residual, {"gate": gate, "log_var": log_var}
+
+        model = self.module.HierarchicalHMambaInteraction(
+            d_model=8,
+            d_state=4,
+            expand_factor=1,
+            keep_ratio=1.0,
+            min_tokens=1,
+            num_rotations=1,
+            window_size=2,
+            use_fast_path=False,
+        )
+        model.reliability_fuser = HalfAuxFuser()
+        features = torch.randn(4, 8, dtype=torch.float32)
+        centers = torch.randn(4, 3, dtype=torch.float32)
+        batch_ids = torch.zeros(4, dtype=torch.long)
+        modality_ids = torch.tensor([0, 1, 0, 1], dtype=torch.long)
+        cls_logits = torch.randn(4, 3, dtype=torch.float32)
+
+        fused, aux = model(
+            features,
+            centers,
+            batch_ids,
+            modality_ids,
+            cls_logits=cls_logits,
+        )
+
+        self.assertEqual(fused.dtype, features.dtype)
+        self.assertEqual(aux["gate"].dtype, features.dtype)
+        self.assertEqual(aux["log_var"].dtype, features.dtype)
+
     def test_small_object_residual_head_reports_configured_tokens(self):
         model = self.module.HierarchicalHMambaInteraction(
             d_model=8,

@@ -58,21 +58,24 @@ def selective_scan_ref(u, delta, A, B, C, D=None, delta_bias=None,
     B = B.float()
     C = C.float()
 
-    # ZOH 离散化：Ā = exp(Δ·A),  B̄ = (Ā - I) / A * B ≈ Δ·B（近似）
-    deltaA = torch.exp(torch.einsum('bdl,dn->bdln', delta, A))  # (B, d_inner, L, d_state)
-    deltaB_u = torch.einsum('bdl,bnl,bdl->bdln', delta, B, u)   # (B, d_inner, L, d_state)
-
-    # 顺序扫描（非并行，仅供调试）
+    # 流式 ZOH 近似扫描。不要一次性物化 (B, d_inner, L, d_state)，
+    # 否则长序列 fallback 会在 16GB 单卡上产生很高显存峰值。
     last_state = u.new_zeros((batch, d_inner, d_state))
     ys = []
     for i in range(L):
-        last_state = deltaA[:, :, i] * last_state + deltaB_u[:, :, i]
-        y = torch.einsum('bdn,bn->bd', last_state, C[:, :, i])
+        delta_i = delta[:, :, i]
+        u_i = u[:, :, i]
+        B_i = B[:, :, i]
+        C_i = C[:, :, i]
+
+        deltaA_i = torch.exp(delta_i.unsqueeze(-1) * A.unsqueeze(0))
+        deltaB_u_i = delta_i.unsqueeze(-1) * B_i.unsqueeze(1) * u_i.unsqueeze(-1)
+        last_state = deltaA_i * last_state + deltaB_u_i
+        y = (last_state * C_i.unsqueeze(1)).sum(dim=-1)
+        if D is not None:
+            y = y + u_i * D.float()[None, :]
         ys.append(y)
     y = torch.stack(ys, dim=2)  # (B, d_inner, L)
-
-    if D is not None:
-        y = y + u * D[:, None]
 
     return y.to(dtype=dtype_in), last_state if return_last_state else y.to(dtype=dtype_in)
 

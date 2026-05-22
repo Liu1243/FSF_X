@@ -36,7 +36,20 @@ class FSFOccCompletionTests(unittest.TestCase):
             pred_visibility=torch.tensor([0.3, 0.7]),
             center_offsets=torch.tensor([[0.0, 0.1, 0.0], [0.2, 0.0, 0.0]]),
         )
-        self.assertEqual(descriptor.shape, (2, 8))
+        self.assertEqual(descriptor.shape, (2, 10))
+        self.assertTrue(torch.equal(descriptor[:, -2:], torch.zeros(2, 2)))
+
+    def test_completion_descriptor_appends_orientation_cues(self):
+        descriptor = self.module.build_completion_descriptor(
+            coarse_scores=torch.tensor([0.1, 0.9, 0.2, 0.8]),
+            refine_scores=torch.tensor([0.2, 0.8, 0.3, 0.7]),
+            instance_ids=torch.tensor([0, 0, 1, 1]),
+            pred_size_residuals=torch.tensor([[1.0, 0.0, 0.5], [0.5, 0.1, 0.2]]),
+            pred_visibility=torch.tensor([0.3, 0.7]),
+            center_offsets=torch.tensor([[0.0, 0.1, 0.0], [0.2, 0.0, 0.0]]),
+            orientation_cues=torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+        )
+        self.assertTrue(torch.equal(descriptor[:, -2:], torch.tensor([[1.0, 0.0], [0.0, 1.0]])))
 
 
 if __name__ == "__main__":

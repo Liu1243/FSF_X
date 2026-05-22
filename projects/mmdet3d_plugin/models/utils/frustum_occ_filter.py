@@ -28,21 +28,75 @@ def ensure_minimum_points_per_instance(
     instance_ids: torch.Tensor,
     scores: torch.Tensor,
     mask: torch.Tensor,
+    min_points: int = 1,
+    class_ids: torch.Tensor = None,
+    class_min_points: dict = None,
 ) -> torch.Tensor:
-    """Guarantee each instance keeps at least one point after filtering."""
+    """Guarantee each instance keeps enough top-scoring points after filtering."""
     if instance_ids.numel() == 0:
         return mask
 
+    min_points = max(int(min_points), 1)
+    class_min_points = class_min_points or {}
     kept = mask.clone()
     for instance_id in torch.unique(instance_ids):
         instance_mask = instance_ids == instance_id
-        if kept[instance_mask].any():
+        target_min_points = min_points
+        if class_ids is not None and class_min_points:
+            valid_classes = class_ids[instance_mask]
+            valid_classes = valid_classes[valid_classes >= 0]
+            if valid_classes.numel() > 0:
+                cls_id = int(valid_classes[0].item())
+                target_min_points = max(
+                    target_min_points,
+                    int(class_min_points.get(cls_id, target_min_points)),
+                )
+        kept_count = int(kept[instance_mask].sum().item())
+        if kept_count >= target_min_points:
             continue
-        local_scores = scores[instance_mask]
-        best_local = local_scores.argmax()
         global_indices = instance_mask.nonzero(as_tuple=False).squeeze(-1)
-        kept[global_indices[best_local]] = True
+        candidate_indices = global_indices[~kept[global_indices]]
+        if candidate_indices.numel() == 0:
+            continue
+        add_count = min(target_min_points - kept_count, int(candidate_indices.numel()))
+        candidate_scores = scores[candidate_indices]
+        _, topk_order = torch.topk(candidate_scores, k=add_count)
+        kept[candidate_indices[topk_order]] = True
     return kept
+
+
+def compute_bev_orientation_cues(
+    points: torch.Tensor,
+    instance_ids: torch.Tensor,
+    valid_mask: torch.Tensor = None,
+) -> torch.Tensor:
+    """Estimate per-instance BEV principal direction as cos/sin cues."""
+    if instance_ids.numel() == 0:
+        return points.new_zeros((0, 2))
+
+    if valid_mask is None:
+        valid_mask = torch.ones_like(instance_ids, dtype=torch.bool)
+
+    cues = []
+    for instance_id in torch.unique(instance_ids):
+        instance_mask = (instance_ids == instance_id) & valid_mask
+        xy = points[instance_mask][:, :2]
+        if xy.shape[0] < 2:
+            cues.append(points.new_zeros(2))
+            continue
+
+        centered = xy - xy.mean(dim=0, keepdim=True)
+        var_x = (centered[:, 0] * centered[:, 0]).mean()
+        var_y = (centered[:, 1] * centered[:, 1]).mean()
+        cov_xy = (centered[:, 0] * centered[:, 1]).mean()
+        spread = var_x + var_y
+        if spread <= 1e-6:
+            cues.append(points.new_zeros(2))
+            continue
+
+        theta = 0.5 * torch.atan2(2.0 * cov_xy, var_x - var_y)
+        cues.append(torch.stack([torch.cos(theta), torch.sin(theta)]))
+    return torch.stack(cues, dim=0)
 
 
 def build_completion_descriptor(
@@ -52,13 +106,16 @@ def build_completion_descriptor(
     pred_size_residuals: torch.Tensor,
     pred_visibility: torch.Tensor,
     center_offsets: torch.Tensor,
+    orientation_cues: torch.Tensor = None,
 ) -> torch.Tensor:
     """Build compact per-instance descriptors for detector-side reuse."""
     if instance_ids.numel() == 0:
-        return pred_size_residuals.new_zeros((0, 8))
+        return pred_size_residuals.new_zeros((0, 10))
 
     descriptors = []
     unique_instance_ids = torch.unique(instance_ids)
+    if orientation_cues is None or orientation_cues.shape[0] != unique_instance_ids.shape[0]:
+        orientation_cues = pred_size_residuals.new_zeros((unique_instance_ids.shape[0], 2))
     for row_idx, instance_id in enumerate(unique_instance_ids):
         mask = instance_ids == instance_id
         descriptors.append(torch.cat([
@@ -68,6 +125,7 @@ def build_completion_descriptor(
             pred_size_residuals[row_idx],
             pred_visibility[row_idx].reshape(1),
             center_offsets[row_idx].norm().reshape(1),
+            orientation_cues[row_idx],
         ]))
     return torch.stack(descriptors, dim=0)
 
@@ -243,6 +301,8 @@ class FrustumOccFilter(BaseModule):
         loss_center_weight: float = 0.5,
         loss_size_weight: float = 0.25,
         loss_visibility_weight: float = 0.25,
+        min_points_per_instance: int = 1,
+        class_min_points_per_instance: dict = None,
     ):
         super().__init__()
         self.occ_thr = occ_thr
@@ -250,6 +310,11 @@ class FrustumOccFilter(BaseModule):
         self.loss_center_weight = loss_center_weight
         self.loss_size_weight = loss_size_weight
         self.loss_visibility_weight = loss_visibility_weight
+        self.min_points_per_instance = max(int(min_points_per_instance), 1)
+        self.class_min_points_per_instance = {
+            int(cls_id): max(int(min_points), 1)
+            for cls_id, min_points in (class_min_points_per_instance or {}).items()
+        }
 
         self.occ_mlp = OccMLP(**occ_mlp_cfg)
 
@@ -502,6 +567,7 @@ class FrustumOccFilter(BaseModule):
         obs_centers: torch.Tensor,
         batch_idx: torch.Tensor,
         gt_bboxes_3d_list: list = None,
+        point_class_ids: torch.Tensor = None,
     ):
         """视锥占据过滤 + 非模态中心修正前向。
 
@@ -529,6 +595,14 @@ class FrustumOccFilter(BaseModule):
             instance_ids=instance_ids,
             scores=refine_occ_prob,
             mask=valid_mask,
+            min_points=self.min_points_per_instance,
+            class_ids=point_class_ids,
+            class_min_points=self.class_min_points_per_instance,
+        )
+        orientation_cues = compute_bev_orientation_cues(
+            points=points,
+            instance_ids=instance_ids,
+            valid_mask=valid_mask,
         )
 
         # ---- Step 2: 实例级补全量回归 ---- #
@@ -560,6 +634,7 @@ class FrustumOccFilter(BaseModule):
                 pred_size_residuals=pred_size_residuals,
                 pred_visibility=pred_visibility,
                 center_offsets=pred_offsets,
+                orientation_cues=orientation_cues,
             ),
         )
         score_dict = dict(

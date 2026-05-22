@@ -110,8 +110,12 @@ class FSF_Occ(FSF):
             loss_center_weight=frustum_occ_filter_cfg.get('loss_center_weight', 0.5),
             loss_size_weight=frustum_occ_filter_cfg.get('loss_size_weight', 0.25),
             loss_visibility_weight=frustum_occ_filter_cfg.get('loss_visibility_weight', 0.25),
+            min_points_per_instance=frustum_occ_filter_cfg.get('min_points_per_instance', 1),
+            class_min_points_per_instance=frustum_occ_filter_cfg.get(
+                'class_min_points_per_instance', None
+            ),
         )
-        self.completion_descriptor_dim = frustum_occ_filter_cfg.get('completion_descriptor_dim', 8)
+        self.completion_descriptor_dim = frustum_occ_filter_cfg.get('completion_descriptor_dim', 10)
 
     # ---------------------------------------------------------------------- #
     #  辅助：获取 SIR 坐标并计算加权中心（供 OccFilter 调用前用）
@@ -180,6 +184,24 @@ class FSF_Occ(FSF):
             bz_coor_fg.squeeze(-1), point_fg_weights_fg
         )
 
+    def _lookup_point_classes_from_sir(self, mask_anno, sir_coors):
+        """Map per-point SIR object ids back to nuScenes class ids."""
+        class_ids = sir_coors.new_full((sir_coors.shape[0],), -1)
+        if mask_anno is None or sir_coors.numel() == 0:
+            return class_ids
+
+        batch_tensor = sir_coors[:, 0].long()
+        obj_ids = sir_coors[:, 2].long() - 1
+        for bidx in range(mask_anno.shape[0]):
+            valid_mask = (
+                (batch_tensor == bidx)
+                & (obj_ids >= 0)
+                & (obj_ids < mask_anno.shape[1])
+            )
+            if valid_mask.any():
+                class_ids[valid_mask] = mask_anno[bidx, obj_ids[valid_mask], 5].long()
+        return class_ids
+
     # ---------------------------------------------------------------------- #
     #  重写 frustum_forward（核心集成点）
     # ---------------------------------------------------------------------- #
@@ -234,6 +256,7 @@ class FSF_Occ(FSF):
             self._get_sir_coors_and_obs_centers(
                 pts_feat, batch_idx.unsqueeze(-1), points, obj_id_tensor, point_fg_weights
             )
+        point_class_ids_fg = self._lookup_point_classes_from_sir(mask_anno, sir_coors)
 
         # ---- FrustumOccFilter：占据过滤 + 非模态中心修正 ---- #
         valid_mask, C_pred, occ_losses, completion_outputs, _ = self.frustum_occ_filter(
@@ -243,6 +266,7 @@ class FSF_Occ(FSF):
             obs_centers=obs_centers,
             batch_idx=batch_idx_fg,
             gt_bboxes_3d_list=gt_bboxes_3d,    # None 时测试模式，自动跳过损失
+            point_class_ids=point_class_ids_fg,
         )
 
         # ---- 将有效点掩码应用到特征（软过滤：背景点置零）---- #

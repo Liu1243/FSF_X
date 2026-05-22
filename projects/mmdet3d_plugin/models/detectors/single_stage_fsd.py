@@ -58,7 +58,7 @@ def find_connected_componets(points, batch_idx, dist):
             adj_mat = dist_mat < dist
             adj_mat = adj_mat.cpu().numpy()
             c_inds = connected_components(adj_mat, directed=False)[1]
-            c_inds = torch.from_numpy(c_inds).to(device).int() + base
+            c_inds = torch.from_numpy(c_inds).to(device=device, dtype=components_inds.dtype) + base
             base = c_inds.max().item() + 1
             components_inds[batch_mask] = c_inds
 
@@ -77,7 +77,7 @@ def find_connected_componets_single_batch(points, batch_idx, dist):
     adj_mat = dist_mat < dist
     adj_mat = adj_mat.cpu().numpy()
     c_inds = connected_components(adj_mat, directed=False)[1]
-    c_inds = torch.from_numpy(c_inds).to(device).int()
+    c_inds = torch.from_numpy(c_inds).to(device=device, dtype=batch_idx.dtype)
 
     return c_inds
 
@@ -687,7 +687,6 @@ class SingleStageFSD(SingleStage3DDetector):
         cfg = self.train_cfg if self.training else self.test_cfg
 
         seg_logits = dict_to_sample['seg_logits']
-        assert (seg_logits < 0).any() # make sure no sigmoid applied
 
         if seg_logits.size(1) == self.num_classes:
             seg_scores = seg_logits.sigmoid()
@@ -780,6 +779,19 @@ class SingleStageFSD(SingleStage3DDetector):
 
         return fg_mask
 
+    def assert_not_softmax_scores(self, seg_logits):
+        if seg_logits.numel() == 0:
+            return
+
+        in_prob_range = ((seg_logits >= 0) & (seg_logits <= 1)).all()
+        if not in_prob_range:
+            return
+
+        row_sums = seg_logits.sum(1)
+        ones = torch.ones_like(row_sums)
+        if torch.allclose(row_sums, ones, rtol=1e-3, atol=1e-3):
+            raise AssertionError('seg_logits appears to be softmax probabilities; raw logits are required')
+
     def split_by_batch(self, data, batch_idx, batch_size):
         assert batch_idx.max().item() + 1 <= batch_size
         data_list = []
@@ -806,7 +818,7 @@ class SingleStageFSD(SingleStage3DDetector):
         cfg = self.train_cfg if self.training else self.test_cfg
 
         seg_logits = dict_to_sample['seg_logits']
-        assert (seg_logits < 0).any() # make sure no sigmoid applied
+        self.assert_not_softmax_scores(seg_logits)
 
         assert seg_logits.size(1) == self.num_classes + 1 # we have background class
         seg_scores = seg_logits.softmax(1)

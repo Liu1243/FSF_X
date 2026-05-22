@@ -213,7 +213,8 @@ def prj_lidar_bbox3d_on_img(bboxes3d,
     valid_mask = valid_mask.reshape(num_bbox, 8)
     valid_mask_bbox = valid_mask.sum(-1) > 0
 
-    pts_2d[:, 2] = torch.clip(pts_2d[:, 2], min=1e-5, max=1e5)
+    max_depth = torch.finfo(pts_2d.dtype).max
+    pts_2d[:, 2] = torch.clip(pts_2d[:, 2], min=1e-5, max=max_depth)
     pts_2d[:, 0] /= pts_2d[:, 2]
     pts_2d[:, 1] /= pts_2d[:, 2]
     imgfov_pts_2d = pts_2d[..., :2].reshape(num_bbox, 8, 2)
@@ -253,4 +254,3 @@ def post_process_coords(
         return min_x, min_y, max_x, max_y
     else:
         return None
-

@@ -149,6 +149,11 @@ def flat2window_v2(feat, inds_dict, padding=0):
 
 def scatter_v2(feat, coors, mode, return_inv=True, min_points=0, unq_inv=None, new_coors=None):
     assert feat.size(0) == coors.size(0)
+    coors = coors.long()
+    if unq_inv is not None:
+        unq_inv = unq_inv.long()
+    if new_coors is not None:
+        new_coors = new_coors.long()
     if mode == 'avg':
         mode = 'mean'
 

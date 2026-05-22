@@ -650,16 +650,20 @@ class HierarchicalHMambaInteraction(nn.Module):
                 pose_delta = small_raw[:, self.d_model : self.d_model + 2]
                 scale_delta = small_raw[:, self.d_model + 2 : self.d_model + 5]
                 temperature = torch.sigmoid(small_raw[:, self.d_model + 5 : self.d_model + 6])
-                small_weight = sel_small_mask.float().unsqueeze(-1)
+                small_weight = sel_small_mask.to(dtype=fused_selected.dtype).unsqueeze(-1)
                 fused_selected = fused_selected + self.small_object_residual_scale * torch.tanh(feat_delta) * small_weight
                 small_object_mask.index_copy_(0, selected_indices, sel_small_mask)
-                small_object_pose.index_copy_(0, selected_indices, pose_delta * small_weight)
-                small_object_scale.index_copy_(0, selected_indices, scale_delta * small_weight)
-                small_object_temperature.index_copy_(0, selected_indices, temperature * small_weight)
+                small_object_pose.index_copy_(0, selected_indices, (pose_delta * small_weight).to(dtype=small_object_pose.dtype))
+                small_object_scale.index_copy_(0, selected_indices, (scale_delta * small_weight).to(dtype=small_object_scale.dtype))
+                small_object_temperature.index_copy_(
+                    0,
+                    selected_indices,
+                    (temperature * small_weight).to(dtype=small_object_temperature.dtype),
+                )
 
-            interacted.index_copy_(0, selected_indices, fused_selected)
-            gate.index_copy_(0, selected_indices, gate_aux["gate"])
-            log_var.index_copy_(0, selected_indices, gate_aux["log_var"])
+            interacted.index_copy_(0, selected_indices, fused_selected.to(dtype=interacted.dtype))
+            gate.index_copy_(0, selected_indices, gate_aux["gate"].to(dtype=gate.dtype))
+            log_var.index_copy_(0, selected_indices, gate_aux["log_var"].to(dtype=log_var.dtype))
 
         aux = {
             "selected_mask": selected_mask,
