@@ -1,5 +1,0 @@
-defaults:
-  - dataset: default
-  - occ: default
-  - ped: default
-  - _self_

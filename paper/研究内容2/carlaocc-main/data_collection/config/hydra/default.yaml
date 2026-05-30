@@ -1,5 +1,0 @@
-run:
-  dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
-job:
-  chdir: false
-

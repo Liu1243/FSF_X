@@ -114,7 +114,6 @@ ckpt
 *.pkl
 *.pkl.json
 *.log.json
-work_dirs/
 exps/
 *~
 mmdet3d/.mim
@@ -125,9 +124,16 @@ mmdet3d/.mim
 mmcv
 mmdetection
 mmdetection3d
-ckpt
-data
 
 tmp
 
 pkgs
+checkpoints/
+work_dirs/**/eval*/
+
+# 第三方论文代码（不跟踪，体积大且非本项目代码）
+paper/研究内容*/
+paper/SparseOcc/
+
+# 训练工作目录（实验输出不提交）
+work_dirs/

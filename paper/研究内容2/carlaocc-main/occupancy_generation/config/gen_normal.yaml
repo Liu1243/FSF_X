@@ -1,4 +1,0 @@
-defaults:
-  - dataset: default
-  - camera: default
-  - _self_
