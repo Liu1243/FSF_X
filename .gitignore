@@ -137,3 +137,4 @@ paper/SparseOcc/
 
 # 训练工作目录（实验输出不提交）
 work_dirs/
+*.pdf
